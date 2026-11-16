@@ -80,6 +80,7 @@
     var article = { kind: 'article', section: '', title: '', subtitle: '', author: '', hero: null,
       authorNote: '', blocks: [], notes: [], sources: [] };
     var lines = linesOf(text), header = true, mode = '', box = null, easy = null, sourceMap = {};
+    var headerFigures = [], subheadings = 0, secondSubheading = -1;
     function addSource(source) {
       var normalized = undecorate(source).replace(/\s+/g, ' ').trim();
       if (!normalized) return 0;
@@ -104,6 +105,12 @@
         article.blocks.push(box); mode = 'box'; header = false; return;
       }
       var kv = keyValue(line), key = kv && Object.prototype.hasOwnProperty.call(ARTICLE_KEYS, kv.key) ? ARTICLE_KEYS[kv.key] : null;
+      // A late metadata line fills a missing field without becoming prose or a
+      // source. Existing fields win once the body has started.
+      if (key && key !== 'hero') {
+        if (header || !article[key]) article[key] = kv.value;
+        return;
+      }
       if (mode === 'sources' && !isSpecial(line)) {
         var marker = line.match(/^(?:\[(\d+)\]|(\d+)[.)])\s*/);
         var number = addSource(line.replace(/^(?:\d+[.)]|\[\d+\]|-)\s*/, ''));
@@ -115,18 +122,31 @@
         box.lines.push({ bullet: /^-\s/.test(line), text: cleanText(line.replace(/^-\s+/, '')) }); return;
       }
       mode = '';
-      if (header && picture && !article.hero) { article.hero = picture; return; }
-      if (header && key) {
-        if (key === 'hero') {
-          if (!article.hero) { article.hero = parseFigure(kv.value); return; }
-        } else { article[key] = kv.value; return; }
+      if (header && picture) {
+        if (!article.hero) article.hero = picture;
+        else headerFigures.push(Object.assign({ type: 'figure' }, picture));
+        return;
       }
       header = false;
       if (picture) article.blocks.push(Object.assign({ type: 'figure' }, picture));
-      else if (/^#{1,3}\s+/.test(line)) article.blocks.push({ type: 'heading', text: cleanText(line.replace(/^#{1,3}\s+/, '')) });
+      else if (/^#{1,3}\s+/.test(line)) {
+        if (/^##\s+/.test(line) && ++subheadings === 2) secondSubheading = article.blocks.length;
+        article.blocks.push({ type: 'heading', text: cleanText(line.replace(/^#{1,3}\s+/, '')) });
+      }
       else if (/^>/.test(line)) article.blocks.push({ type: 'quote', text: cleanText(line.replace(/^>\s*/, '')) });
       else { var body = cleanText(line); if (body) article.blocks.push({ type: 'paragraph', text: body }); }
     });
+    if (headerFigures.length) {
+      var insertion = secondSubheading, paragraphs = 0;
+      if (insertion < 0) {
+        insertion = article.blocks.length;
+        article.blocks.some(function (block, index) {
+          if (block.type === 'paragraph' && ++paragraphs === 3) { insertion = index + 1; return true; }
+          return false;
+        });
+      }
+      article.blocks.splice.apply(article.blocks, [insertion, 0].concat(headerFigures));
+    }
     // Reserve explicit source numbers first, then collect inline citations. This
     // makes [1] stable even when an inline citation precedes the final source list.
     function references(value) {
@@ -220,12 +240,15 @@
   }
   function hasArticleImages(article) { return pieceFigures(article).some(function (entry) { return !!safeImageURL(entry.model.src); }); }
   function inline(node, value, citations) {
-    var pattern = citations === false ? /(https:\/\/[^\s<>]+)/g : /\[(\d+)\]/g;
+    var pattern = citations === false ? /(?:https:\/\/|www\.)[^\s<>]+/gi : /\[(\d+)\]/g;
     var last = 0, match;
     while ((match = pattern.exec(value))) {
       node.appendChild(document.createTextNode(value.slice(last, match.index)));
       if (citations === false) {
-        var link = element('a', '', match[0]); link.href = match[0]; link.rel = 'noreferrer'; node.appendChild(link);
+        var address = match[0], label = Array.from(address.replace(/^https:\/\//i, '').replace(/^www\./i, ''));
+        var link = element('a', '', label.length > 38 ? label.slice(0, 36).join('') + '…' : label.join(''));
+        link.href = /^www\./i.test(address) ? 'https://' + address : address;
+        link.title = address; link.rel = 'noreferrer'; node.appendChild(link);
       } else { var sup = element('sup', 'qm-reference', match[1]); sup.setAttribute('aria-label', '출처 ' + match[1]); node.appendChild(sup); }
       last = pattern.lastIndex;
     }
@@ -300,23 +323,26 @@
     .qm-box h3 { margin:0 0 2mm; font-size:10pt; color:var(--qm-color); }
     .qm-box p { margin:1mm 0; }
     .qm-box ul { padding-left:4mm; margin:2mm 0; }
-    .qm-source { margin:0 0 2mm; padding-left:5mm; font-size:7pt; line-height:1.65; overflow-wrap:anywhere; text-align:left; }
+    .qm-source { margin:0 0 2mm; padding-left:5mm; font-size:6.5pt; line-height:1.35; overflow-wrap:anywhere; text-align:left; }
     .qm-source.qm-continuation { list-style:none; }
     .qm-source a { color:inherit; text-decoration-thickness:1px; text-underline-offset:2px; }
-    .qm-cover { --qm-color:#1f5f8b; }
+    .qm-compact .qm-hero .qm-image-frame { height:64mm; }
+    .qm-compact .qm-columns .qm-figure .qm-image-frame { aspect-ratio:16/10; }
+    .qm-compact .qm-source { font-size:6.2pt; }
+    .qm-compact .qm-quote { font-size:12pt; }
+    .qm-cover { --qm-color:#1f5f8b; padding-top:calc(5mm + var(--qm-bleed)); }
     .qm-cover .qm-inner { display:flex; flex-direction:column; z-index:2; pointer-events:none; }
-    .qm-cover::before { content:''; position:absolute; inset:0; z-index:1; pointer-events:none; background:linear-gradient(to bottom,#fff 0%,rgba(255,255,255,.95) 22%,rgba(255,255,255,.1) 46%,#fff 68%); }
-    .qm-cover[data-orientation='portrait']::before { background:linear-gradient(to bottom,rgba(255,255,255,.98) 0%,rgba(255,255,255,.9) 23%,rgba(255,255,255,.08) 43%,rgba(255,255,255,.95) 70%,#fff 100%); }
+    .qm-cover-masthead { flex:none; min-height:55mm; padding-block:5mm; }
     .qm-cover-name { color:var(--qm-color); font-size:43pt !important; line-height:1.15 !important; margin:3mm 0 5mm !important; }
     .qm-cover-english { font:700 10pt/1.4 'Pretendard Variable',sans-serif; letter-spacing:.08em; margin:0; }
-    .qm-cover-meta { font:10pt/1.7 'Pretendard Variable',sans-serif; margin:0 0 8mm; }
-    .qm-cover > .qm-figure { position:absolute; inset:0 0 auto; height:66.6667%; margin:0; }
-    .qm-cover[data-orientation='portrait'] > .qm-figure { height:100%; }
+    .qm-cover-meta { font:10pt/1.7 'Pretendard Variable',sans-serif; margin:0; }
+    .qm-cover > .qm-figure { position:absolute; inset:calc(60mm + var(--qm-bleed)) 0 0; margin:0; }
+    .qm-cover > .qm-figure figcaption { display:none; }
     .qm-cover .qm-image-frame { height:100%; aspect-ratio:auto; }
     .qm-cover .qm-image-frame:focus-visible { outline-offset:-4px; }
     .qm-cover .qm-image-help { padding-inline:calc(12mm + var(--qm-bleed)); }
-    .qm-cover-caption { margin:0; font-size:7.5pt; }
-    .qm-cover-questions { margin-top:auto; padding-top:5mm; }
+    .qm-cover::before { content:''; position:absolute; inset:0 0 auto; height:calc(60mm + var(--qm-bleed)); background:#f8f6f0; }
+    .qm-cover-questions { margin-top:auto; padding:6mm; background:rgba(255,255,255,.92); border-radius:3mm; }
     .qm-cover-questions h2 { font-size:12pt; margin:0 0 3mm; }
     .qm-cover-question,.qm-cover-item { display:flex; align-items:baseline; gap:3mm; margin:2mm 0; font-family:'Pretendard Variable',sans-serif; }
     .qm-cover-question { font-size:22pt; line-height:1.35; }
@@ -564,6 +590,28 @@
     inline(node, block.text); return node;
   }
   function overflows(node) { return node.scrollWidth > node.clientWidth + 1 || node.scrollHeight > node.clientHeight + 1; }
+  function contentArea(node, bounds) {
+    return Array.from(node.children).reduce(function (area, child) {
+      // These containers have a fixed height even when only one line is used.
+      if (['qm-columns', 'qm-flow', 'qm-note-grid'].some(function (name) { return child.classList.contains(name); })) return area + contentArea(child, bounds);
+      return area + Array.from(child.getClientRects()).reduce(function (sum, rect) {
+        var width = Math.max(0, Math.min(rect.right, bounds.right) - Math.max(rect.left, bounds.left));
+        var height = Math.max(0, Math.min(rect.bottom, bounds.bottom) - Math.max(rect.top, bounds.top));
+        return sum + width * height;
+      }, 0);
+    }, 0);
+  }
+  function fillRatio(page, bodyOnly) {
+    var node = bodyOnly ? page.columns : page.inner;
+    var bounds = node.getBoundingClientRect(), capacity = bounds.width * bounds.height;
+    if (!capacity) return 0;
+    var area = contentArea(node, bounds);
+    if (!bodyOnly && page.kind === 'cover') {
+      var artwork = page.paper.querySelector('.qm-figure');
+      if (artwork) area += contentArea(artwork, bounds);
+    }
+    return Math.min(1, area / capacity);
+  }
   function firstRect(node) {
     var range = document.createRange(); range.selectNodeContents(node);
     var rects = Array.from(range.getClientRects()).filter(function (rect) { return rect.width && rect.height; });
@@ -611,8 +659,9 @@
   function attachEasy(page, groups, bottom) {
     page.easy = easyNode(groups, bottom); page.inner.insertBefore(page.easy, page.columns); sizeArticleColumns(page);
   }
-  function articlePage(article, first, firstPart, groups) {
+  function articlePage(article, first, firstPart, groups, compact) {
     var page = makePage('article', article, first ? '' : state.cover.name + ' · ' + (article.section || '질문'));
+    if (compact) page.paper.classList.add('qm-compact');
     var head;
     if (first) {
       head = element('header', 'qm-article-head');
@@ -656,15 +705,15 @@
     }
     return { head: words.slice(0, best).join(''), tail: words.slice(best).join('') };
   }
-  function renderArticle(article, firstPart) {
+  function paginateArticle(article, firstPart, compact) {
     var groups = easyGroups(article), blocks = article.blocks.filter(function (block) { return block.type !== 'easy'; });
     if (article.notes.length) blocks.push({ type: 'notes', title: '취재 노트', lines: article.notes.map(function (note) { return { text: note.key + ': ' + note.value, bullet: false }; }) });
     if (article.sources.length) {
       blocks.push({ type: 'heading', text: '출처' });
       article.sources.forEach(function (text, index) { blocks.push({ type: 'source', text: text, number: index + 1 }); });
     }
-    var page = articlePage(article, true, firstPart), firstPage = page, pageCount = 1, pending = [];
-    function nextPage() { pageCount += 1; page = articlePage(article, false, false, pageCount === 2 ? groups : null); }
+    var page = articlePage(article, true, firstPart, null, compact), firstPage = page, pageCount = 1, pending = [];
+    function nextPage() { pageCount += 1; page = articlePage(article, false, false, pageCount === 2 ? groups : null, compact); }
     function attachHeadings() { return pending.map(function (heading) { var node = blockNode(heading); page.columns.appendChild(node); return node; }); }
     for (var i = 0; i < blocks.length; i += 1) {
       var block = blocks[i];
@@ -699,6 +748,33 @@
       }
     }
   }
+  function renderArticle(article, firstPart) {
+    var start = state.pages.length, failureStart = state.failures.length;
+    paginateArticle(article, firstPart, false);
+    var regular = state.pages.slice(start), failures = state.failures.slice(failureStart);
+    if (regular.length < 2 || fillRatio(regular[regular.length - 1], true) >= .35) return;
+    // Keep the first layout intact until a measured compact trial saves a page.
+    regular.forEach(function (page) { page.shell.remove(); });
+    state.pages.splice(start); state.failures.splice(failureStart);
+    var useCompact = false;
+    try {
+      paginateArticle(article, firstPart, true);
+      var compact = state.pages.slice(start);
+      useCompact = compact.length < regular.length && state.failures.length === failureStart && !compact.some(function (page) {
+        return overflows(page.columns) || overflows(page.inner) || page.bodyHeight < 0;
+      });
+    } catch (error) { /* A failed trial must not damage the original layout. */ }
+    if (!useCompact) {
+      state.pages.splice(start).forEach(function (page) { page.shell.remove(); });
+      state.failures.splice(failureStart);
+      regular.forEach(function (page) { stage.appendChild(page.shell); state.pages.push(page); });
+      Array.prototype.push.apply(state.failures, failures);
+    }
+    figureViews.forEach(function (views, model) {
+      views.forEach(function (view) { if (!view.figure.isConnected) views.delete(view); });
+      if (!views.size) figureViews.delete(model);
+    });
+  }
 
   function orderedArticles() {
     var articles = state.pieces.filter(function (piece) { return piece.kind === 'article'; });
@@ -707,8 +783,9 @@
     return sections.reduce(function (all, section) { return all.concat(articles.filter(function (piece) { return piece.section === section; })); }, []);
   }
   function coverQuestions(cover, articles) {
-    var featured = articles.find(function (article) { return article.title === cover.question; }) || articles[0];
-    return (featured ? [featured].concat(articles.filter(function (article) { return article !== featured; })) : []).slice(0, 5);
+    var candidates = articles.filter(function (article) { return article.section === '사회과학' || article.section === '자연과학'; });
+    var question = cover.question || (candidates[0] || {}).title;
+    return candidates.filter(function (article) { return article.title !== question; }).slice(0, 5);
   }
   function renderCover(cover, articles) {
     var page = makePage('cover'); page.paper.appendChild(element('div', 'qm-cover-strip'));
@@ -716,22 +793,23 @@
       var artwork = figureNode(cover.hero, true), caption = artwork.querySelector('figcaption');
       if (caption) caption.remove(); page.paper.insertBefore(artwork, page.inner);
     }
-    page.inner.appendChild(element('p', 'qm-cover-english', cover.english));
-    page.inner.appendChild(element('h1', 'qm-cover-name', cover.name));
-    page.inner.appendChild(element('p', 'qm-cover-meta', [cover.issue, cover.school].filter(Boolean).join(' | ')));
-    if (cover.hero && cover.hero.caption) page.inner.appendChild(element('p', 'qm-cover-caption', cover.hero.caption));
+    var masthead = element('header', 'qm-cover-masthead');
+    masthead.appendChild(element('p', 'qm-cover-english', cover.english));
+    masthead.appendChild(element('h1', 'qm-cover-name', cover.name));
+    masthead.appendChild(element('p', 'qm-cover-meta', [cover.issue, cover.school].filter(Boolean).join(' | ')));
+    page.inner.appendChild(masthead);
     var questions = element('section', 'qm-cover-questions'); questions.appendChild(element('h2', '', '이번 호 질문'));
-    var selected = coverQuestions(cover, articles);
-    var customQuestion = cover.question && !selected.some(function (article) { return article.title === cover.question; });
-    if (customQuestion) questions.appendChild(element('h3', 'qm-cover-question', cover.question));
-    selected.forEach(function (article, index) {
-      var primary = index === 0 && !customQuestion;
+    var featured = cover.question ? articles.find(function (article) { return article.title === cover.question; }) || { title: cover.question, section: '' }
+      : articles.find(function (article) { return article.section === '사회과학' || article.section === '자연과학'; });
+    function questionRow(article, primary) {
       var row = element(primary ? 'h3' : 'p', primary ? 'qm-cover-question' : 'qm-cover-item');
       var dot = element('span', 'qm-question-dot'); dot.style.setProperty('--qm-color', sectionColor(article.section)); dot.setAttribute('aria-hidden', 'true');
       row.appendChild(dot); row.appendChild(element('span', '', article.title || '제목 없는 기사')); questions.appendChild(row);
-    });
+    }
+    if (featured) questionRow(featured, true);
+    coverQuestions(cover, articles).forEach(function (article) { questionRow(article, false); });
+    if (cover.tagline) questions.appendChild(element('p', 'qm-cover-tagline', cover.tagline));
     page.inner.appendChild(questions);
-    if (cover.tagline) page.inner.appendChild(element('p', 'qm-cover-tagline', cover.tagline));
     page.paper.querySelector('.qm-folio').hidden = true;
   }
   function flowPage(kind, title, grid) {
@@ -869,6 +947,11 @@
         easyGroups(piece).forEach(function (group) { if (group.panels.length < 2 || group.panels.length > 4) result.warnings.push((piece.title || '제목 없는 기사') + ': 쉽게 보기 그림은 2~4컷으로 넣어 주세요. 현재 ' + group.panels.length + '컷입니다.'); });
       }
     });
+    state.pages.forEach(function (page) {
+      if (['questions', 'memo', 'back'].indexOf(page.kind) < 0 && fillRatio(page, false) < .15) {
+        result.warnings.push(page.paper.dataset.page + '쪽: 거의 빈 쪽입니다.');
+      }
+    });
     if (stage) {
       state.pages.forEach(function (page) {
         var reasons = [];
@@ -992,6 +1075,8 @@
     if (piece.hero) lines.push(picture(piece.hero));
     if (piece.authorNote) lines.push('기자의 말: ' + piece.authorNote);
     lines.push('');
+    // End metadata before a leading body figure so reload does not relocate it.
+    if (piece.blocks.length && piece.blocks[0].type === 'figure') lines.push('[문단]');
     piece.blocks.forEach(function (block) {
       if (block.type === 'figure') lines.push(picture(block));
       else if (block.type === 'easy') { lines.push('[쉽게 보기] ' + block.title); block.panels.forEach(function (panel) { lines.push(picture(panel)); }); lines.push(''); }

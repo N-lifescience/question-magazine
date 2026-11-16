@@ -9,8 +9,9 @@ const { parseArticle, parseCover, ready, imagesReady } = require('../magazine.js
 // public API stays unchanged; this exercises the real save/reload grammar.
 const source = readFileSync(new URL('../magazine.js', import.meta.url), 'utf8');
 const sandbox = { module: { exports: {} }, URL };
-const helpers = ['serialize', 'readPieces', 'droppedImageURL', 'pieceFigures', 'hasArticleImages', 'coverQuestions', 'state', 'prepareImages', 'shrinkImage', 'replaceFigure', 'unsavedImages', 'hasUnsavedImages'];
-runInNewContext(source.replace('  return api;\n}));', helpers.map(name => '  api.' + name + ' = ' + name + ';').join('\n') + '\n  return api;\n}));'), sandbox);
+const helpers = ['serialize', 'readPieces', 'droppedImageURL', 'pieceFigures', 'hasArticleImages', 'coverQuestions', 'state', 'prepareImages', 'shrinkImage', 'replaceFigure', 'unsavedImages', 'hasUnsavedImages', 'inline', 'fillRatio', 'renderArticle', 'renderCover'];
+const expose = helpers.map(name => '  api.' + name + ' = ' + name + ';').join('\n') + '\n  api.setSurface = function (surface) { stage = surface; };';
+runInNewContext(source.replace('  return api;\n}));', expose + '\n  return api;\n}));'), sandbox);
 const serialize = sandbox.module.exports.serialize;
 const readPieces = sandbox.module.exports.readPieces;
 let passed = 0;
@@ -72,9 +73,85 @@ test('세 종류 소제목, 따옴글과 본문 그림', () => {
   assert.equal(a.blocks[5].caption, '틀만 있는 그림');
 });
 
-test('머리 칸 첫 그림만 대표 그림이고 다음 그림은 본문', () => {
+test('머리 칸 첫 그림만 대표 그림이고 나머지는 본문 끝, 늦은 기자 줄은 머리 칸', () => {
   const a = parseArticle('제목: 물음\n그림: https://example.org/a.png | 대표\n그림: 본문 자리\n문단\n기자: 이것은 본문이다.');
-  assert.equal(a.hero.caption, '대표'); assert.equal(a.blocks[0].type, 'figure'); assert.equal(a.blocks[2].text, '기자: 이것은 본문이다.');
+  assert.equal(a.hero.caption, '대표'); assert.deepEqual(a.blocks.map(b => b.type), ['paragraph', 'figure']);
+  assert.equal(a.author, '이것은 본문이다.');
+});
+
+// Six short, self-contained articles with the same header shape as the imported
+// magazine. Regression tests deliberately do not read anything under samples/.
+const sixArticles = Array.from({ length: 6 }, (_, i) => `꼭지: ${i < 3 ? '사회과학' : '자연과학'}
+제목: 질문 ${i + 1}
+부제: 함께 살펴본 일
+기자: 필명 ${i + 1}
+그림: ![대표 그림](https://example.org/hero-${i}.jpg)
+그림: ![본문 그림](https://example.org/body-${i}.jpg) | 관찰한 장면
+기자의 말: 자료를 읽고 생각 ${i + 1}을 바꿨다.
+## 궁금해진 순간
+처음 관찰한 일이다.
+다시 살펴보았다.
+## 알아본 까닭
+근거를 찾아보았다.
+## 남은 질문
+다음에 알아볼 일이다.`);
+
+test('두 그림 뒤 기자의 말이 있는 여섯 기사 모두 authorNote와 둘째 소제목 앞 그림을 보존한다', () => {
+  const articles = sixArticles.map(parseArticle);
+  assert.equal(articles.length, 6);
+  articles.forEach((a, i) => {
+    assert.equal(a.authorNote, `자료를 읽고 생각 ${i + 1}을 바꿨다.`);
+    assert.equal(a.hero.src, `https://example.org/hero-${i}.jpg`);
+    const second = a.blocks.findIndex(b => b.text === '알아본 까닭');
+    assert.equal(a.blocks[second - 1].type, 'figure');
+    assert.equal(a.blocks[second - 1].src, `https://example.org/body-${i}.jpg`);
+    assert.ok(!a.blocks.some(b => b.text?.startsWith('기자의 말:')));
+    assert.deepEqual(parseArticle(serialize(a)), a);
+  });
+});
+
+test('머리 칸 그림은 여러 장이어도 끝나지 않고 순서대로 둘째 ## 앞에 옮긴다', () => {
+  const a = parseArticle('그림: 대표\n사진: 둘째\n이미지: 셋째\n\n기자: 별\n제목: 물음\n부제: 짧게\n기자의 말: 달라졌다.\n# 큰 제목\n### 작은 제목\n## 첫째\n문단\n## 둘째\n문단');
+  assert.equal(a.author, '별'); assert.equal(a.title, '물음'); assert.equal(a.subtitle, '짧게'); assert.equal(a.authorNote, '달라졌다.');
+  assert.deepEqual(a.blocks.map(b => b.text || b.caption), ['큰 제목', '작은 제목', '첫째', '문단', '둘째', '셋째', '둘째', '문단']);
+  assert.deepEqual(a.blocks.slice(4, 6).map(b => b.type), ['figure', 'figure']);
+});
+
+test('##가 둘 미만이면 머리 칸 추가 그림을 셋째 문단 뒤에 넣는다', () => {
+  for (const heading of ['', '# 제목\n', '## 제목\n', '### 제목\n### 다음\n']) {
+    const a = parseArticle('그림: 대표\n그림: 추가\n' + heading + '첫 문단\n> 따옴글\n둘째 문단\n셋째 문단\n넷째 문단');
+    const index = a.blocks.findIndex(b => b.type === 'figure');
+    assert.equal(a.blocks[index - 1].text, '셋째 문단');
+    assert.equal(a.blocks[index + 1].text, '넷째 문단');
+  }
+});
+
+test('셋째 문단도 없으면 추가 그림은 끝에 두고 본문 그림은 옮기지 않는다', () => {
+  const a = parseArticle('그림: 대표\n그림: 머리 추가\n첫 문단\n그림: 본문 자리\n둘째 문단');
+  assert.deepEqual(a.blocks.map(b => b.text || b.caption), ['첫 문단', '본문 자리', '둘째 문단', '머리 추가']);
+  const empty = parseArticle('그림: 대표\n그림: 추가\n기자의 말: 달라졌다.');
+  assert.deepEqual(parseArticle(serialize(empty)), empty);
+});
+
+test('본문 중간의 알려진 머리 키는 빈 칸만 채우고 문단으로 만들지 않는다', () => {
+  for (const [key, field] of [['기자의 말', 'authorNote'], ['부제', 'subtitle'], ['기자', 'author'], ['꼭지', 'section'], ['제목', 'title']]) {
+    const a = parseArticle(`첫 문단\n${key}: 값\n다음 문단\n${key}: 덮어쓰지 않을 값\n${key}:`);
+    assert.equal(a[field], '값'); assert.deepEqual(a.blocks.map(b => b.text), ['첫 문단', '다음 문단']);
+    const filled = parseArticle(`${key}: 원래 값\n본문\n${key}: 다른 값`);
+    assert.equal(filled[field], '원래 값'); assert.equal(filled.blocks.length, 1);
+  }
+});
+
+test('출처 뒤의 늦은 머리 키도 출처 목록에 섞이지 않는다', () => {
+  const a = body('본문\n출처:\n1. 자료\n기자의 말: 다시 생각했다.\n부제: 뒤늦은 요약');
+  assert.equal(a.authorNote, '다시 생각했다.'); assert.equal(a.subtitle, '뒤늦은 요약');
+  assert.deepEqual(a.sources, ['자료']);
+});
+
+test('머리 칸 다음에 본문 그림부터 나오는 저장본도 위치와 대표 그림을 보존한다', () => {
+  const a = parseArticle('제목: 그림\n[문단]\n그림: 본문 자리\n첫 문단\n## 첫째\n문단\n## 둘째\n문단');
+  assert.equal(a.hero, null); assert.equal(a.blocks[0].type, 'figure');
+  assert.deepEqual(parseArticle(serialize(a)), a);
 });
 
 test('세 가지 inline 출처를 모으고 중복은 한 번만', () => {
@@ -279,11 +356,173 @@ test('끌어온 HTML에서 img src만 꺼내고 주소의 HTML entity를 푼다'
   assert.equal(read(transfer('', '<img alt=" src=\'https://example.org/false\' " src="http://example.org/unsafe">')), '');
 });
 
-test('표지 질문은 대표 기사를 먼저 두고 기사 제목을 최대 다섯 개 고른다', () => {
-  const articles = Array.from({ length: 8 }, (_, i) => body('제목: 물음 ' + i));
+test('표지의 나머지 질문은 대표 질문을 빼고 기사 제목을 최대 다섯 개 고른다', () => {
+  const articles = Array.from({ length: 8 }, (_, i) => parseArticle('꼭지: 자연과학\n제목: 물음 ' + i));
   const selected = sandbox.module.exports.coverQuestions({ question: '물음 6' }, articles);
-  assert.equal(selected.length, 5); assert.equal(selected[0].title, '물음 6');
+  assert.equal(selected.length, 5); assert.equal(selected[0].title, '물음 0');
+  assert.ok(selected.every(a => a.title !== '물음 6'));
   assert.equal(new Set(selected).size, 5); assert.equal(articles[0].title, '물음 0');
+});
+
+test('표지 목록은 사회과학과 자연과학만 받고 같은 제목의 대표 질문을 모두 뺀다', () => {
+  const articles = ['여는 글', '그 밖의 질문', '사회과학', '자연과학', '사회과학'].map((section, i) => parseArticle(`꼭지: ${section}\n제목: ${i === 4 ? '물음 2' : '물음 ' + i}`));
+  const select = sandbox.module.exports.coverQuestions;
+  assert.deepEqual(Array.from(select({ question: '물음 2' }, articles), a => a.title), ['물음 3']);
+  assert.deepEqual(Array.from(select({ question: '' }, articles), a => a.title), ['물음 3']);
+  assert.equal(select({ question: '별도 질문' }, articles).length, 3);
+  assert.equal(select({ question: '' }, articles.slice(0, 2)).length, 0);
+});
+
+// A small DOM double checks the generated structure and safe text insertion.
+// It does not measure browser layout or pretend to render CSS.
+class TextElement {
+  constructor(tag) { this.tagName = tag; this.children = []; this.dataset = {}; this.className = ''; this.style = { setProperty() {} }; }
+  get classList() { return { contains: name => this.className.split(' ').includes(name) }; }
+  get textContent() { return this.children.map(child => child.textContent).join(''); }
+  set textContent(value) { this.children = [{ textContent: String(value) }]; }
+  set innerHTML(value) { throw new Error('사용자 HTML 삽입 금지: ' + value); }
+  appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
+  insertBefore(child, before) { child.parentElement = this; this.children.splice(this.children.indexOf(before), 0, child); return child; }
+  remove() { if (this.parentElement) { const siblings = this.parentElement.children; siblings.splice(siblings.indexOf(this), 1); this.parentElement = null; } }
+  setAttribute(name, value) { this[name] = value; }
+  removeAttribute(name) { delete this[name]; }
+  addEventListener() {}
+  querySelectorAll(selector) {
+    const found = [];
+    for (const child of this.children) {
+      if (!(child instanceof TextElement)) continue;
+      if (selector[0] === '.' ? child.classList.contains(selector.slice(1)) : child.tagName === selector) found.push(child);
+      found.push(...child.querySelectorAll(selector));
+    }
+    return found;
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+}
+sandbox.document = { createElement: tag => new TextElement(tag), createTextNode: text => ({ textContent: text }) };
+
+test('출처 주소는 접두어를 떼고 38자를 넘으면 36자와 …로 표시하며 전체 링크와 title을 남긴다', () => {
+  const inline = sandbox.module.exports.inline;
+  for (const length of [38, 39, 80]) {
+    const label = 'example.org/' + '가'.repeat(length - 12), address = 'https://www.' + label;
+    const node = new TextElement('li'); inline(node, '자료, ' + address, false);
+    const link = node.querySelector('a');
+    assert.equal(link.textContent, length > 38 ? [...label].slice(0, 36).join('') + '…' : label);
+    assert.equal(link.href, address); assert.equal(link.title, address);
+  }
+});
+
+test('출처의 www 주소도 HTTPS 링크로 열고 사용자 HTML 같은 글은 텍스트로 둔다', () => {
+  const node = new TextElement('li'), text = '<img src=x onerror=alert(1)> 자료 ';
+  sandbox.module.exports.inline(node, text + 'www.example.org/a https://example.org/b', false);
+  assert.equal(node.textContent, text + 'example.org/a example.org/b');
+  assert.equal(node.querySelectorAll('img').length, 0);
+  assert.equal(node.querySelectorAll('a')[0].href, 'https://www.example.org/a');
+  assert.equal(node.querySelectorAll('a')[0].title, 'www.example.org/a');
+});
+
+test('표지는 머리 띠와 질문 카드로 묶고 설명 줄을 빼며 문구를 카드 안에 둔다', () => {
+  const api = sandbox.module.exports, surface = new TextElement('main');
+  const cover = parseCover('잡지: <물음>\n영문: QUESTION\n호: 첫 호\n학교: 우리 학교\n그림: https://example.org/landscape.jpg | 그림 설명\n대표 질문: 물음 2\n문구: 함께 묻자');
+  const articles = ['여는 글', '사회과학', '자연과학', '그 밖의 질문'].map((section, i) => parseArticle(`꼭지: ${section}\n제목: 물음 ${i}`));
+  api.state.cover = cover; api.state.pages = []; api.setSurface(surface);
+  try {
+    api.renderCover(cover, articles);
+    const page = api.state.pages[0], head = page.inner.children[0], card = page.inner.children[1];
+    assert.equal(head.className, 'qm-cover-masthead'); assert.ok(head.textContent.includes('<물음>'));
+    assert.equal(card.className, 'qm-cover-questions'); assert.equal(card.querySelector('.qm-cover-question').textContent, '물음 2');
+    assert.deepEqual(card.querySelectorAll('.qm-cover-item').map(node => node.textContent), ['물음 1']);
+    assert.equal(card.querySelector('.qm-cover-tagline').textContent, '함께 묻자');
+    assert.equal(page.paper.querySelector('figcaption'), null); assert.equal(page.paper.querySelector('.qm-cover-caption'), null);
+    assert.equal(page.paper.querySelector('img').alt, '그림 설명');
+    assert.equal(page.paper.querySelector('img').src, cover.hero.src);
+  } finally { api.state.pages = []; api.setSurface(null); }
+});
+
+const rect = (left, top, width, height) => ({ left, top, width, height, right: left + width, bottom: top + height });
+const geometry = (rects, names = [], children = []) => ({
+  children, classList: { contains: name => names.includes(name) }, getClientRects: () => rects, getBoundingClientRect: () => rects[0]
+});
+
+test('채움은 두 단의 실제 조각 넓이를 더하고 화면 배율이 바뀌어도 같다', () => {
+  for (const scale of [1, .4]) {
+    const r = (left, top, width, height) => rect(left * scale, top * scale, width * scale, height * scale);
+    const columns = geometry([r(0, 0, 200, 100)], ['qm-columns'], [geometry([r(0, 0, 90, 100), r(110, 0, 90, 30)])]);
+    assert.ok(Math.abs(sandbox.module.exports.fillRatio({ columns }, true) - .585) < 1e-9);
+  }
+});
+
+test('고정 높이 흐름 상자와 2단의 빈 공간을 채움으로 세지 않는다', () => {
+  const area = rect(0, 0, 200, 100);
+  const flow = geometry([area], ['qm-flow'], [geometry([rect(0, 0, 200, 14)])]);
+  const page = { kind: 'contents', inner: geometry([area], [], [flow]) };
+  assert.equal(sandbox.module.exports.fillRatio(page, false), .14);
+  flow.children = [geometry([rect(0, 0, 200, 10)]), geometry([rect(0, 90, 200, 30)])];
+  assert.equal(sandbox.module.exports.fillRatio(page, false), .2, '쪽 바깥 넓이는 제외한다');
+});
+
+test('audit은 채움 15% 미만을 거의 빈 쪽으로 알리고 독자 질문함, 메모, 뒤표지는 뺀다', () => {
+  const api = sandbox.module.exports;
+  api.state.pieces = [];
+  api.state.pages = ['article', 'contents', 'author-notes', 'cover', 'article', 'questions', 'memo', 'back'].map((kind, i) => ({
+    kind, paper: { dataset: { page: String(i + 1) }, querySelector: () => null },
+    inner: geometry([rect(0, 0, 100, 100)], [], [geometry([rect(0, 0, 100, i === 4 ? 15 : 14)])])
+  }));
+  try {
+    const warnings = api.audit().warnings.filter(w => w.includes('거의 빈 쪽'));
+    assert.deepEqual(Array.from(warnings), [1, 2, 3, 4].map(n => n + '쪽: 거의 빈 쪽입니다.'));
+  } finally { api.state.pages = []; }
+});
+
+// Isolate the real retry/rollback controller from browser measurements. The
+// renderer is given synthetic pagination results; pixel layout remains manual.
+function paginationTrial(options = {}) {
+  const context = { module: { exports: {} }, URL };
+  const setup = '\n  api.setPagination = function (paginate, fill, surface) { paginateArticle = paginate; fillRatio = fill; stage = surface; };';
+  runInNewContext(source.replace('  return api;\n}));', expose + setup + '\n  return api;\n}));'), context);
+  const api = context.module.exports, surface = { children: [], appendChild(shell) { this.children.push(shell); } }, calls = [], original = [], trial = [];
+  const before = { shell: { remove() { throw new Error('다른 기사 쪽을 지웠다.'); } } };
+  surface.appendChild(before.shell); api.state.pages = [before]; api.state.failures = ['이전 기사 오류'];
+  api.setPagination((article, firstPart, compact) => {
+    calls.push([article, firstPart, compact]);
+    const pages = compact ? trial : original, count = compact ? options.compactCount ?? 1 : options.normalCount ?? 2;
+    for (let i = 0; i < count; i++) {
+      const node = { clientWidth: 100, clientHeight: 100, scrollWidth: compact && options.overflow ? 110 : 100, scrollHeight: 100 };
+      const shell = { remove() { surface.children.splice(surface.children.indexOf(this), 1); } };
+      const page = { shell, columns: node, inner: node, bodyHeight: compact && options.negativeHeight ? -1 : 100 };
+      pages.push(page); api.state.pages.push(page); surface.appendChild(shell);
+      if (compact && options.throws) throw new Error('시험 중 쪽 나누기 실패');
+    }
+    if (compact && options.trialFailure) api.state.failures.push('시험 중 오류');
+    if (!compact && options.originalFailure) api.state.failures.push('기존 오류');
+  }, (page, bodyOnly) => {
+    assert.equal(page, original.at(-1)); assert.equal(bodyOnly, true); return options.fill ?? .34;
+  }, surface);
+  const article = body('본문'); api.renderArticle(article, true);
+  assert.equal(api.state.pages[0], before); assert.equal(surface.children[0], before.shell);
+  assert.ok(calls.every(([piece, firstPart]) => piece === article && firstPart === true));
+  assert.deepEqual(surface.children, Array.from(api.state.pages, page => page.shell));
+  return { api, calls, original, trial };
+}
+
+test('마지막 쪽 채움이 35% 미만이면 그 기사만 한 번 다시 나눠 줄어든 쪽수를 채택한다', () => {
+  const { api, calls, trial } = paginationTrial();
+  assert.deepEqual(calls.map(call => call[2]), [false, true]);
+  assert.deepEqual(api.state.pages.slice(1), trial); assert.deepEqual(api.state.failures, ['이전 기사 오류']);
+});
+
+test('한 쪽 기사와 채움 35% 이상인 기사는 촘촘하게 다시 나누지 않는다', () => {
+  for (const options of [{ normalCount: 1, fill: .01 }, { fill: .35 }, { fill: .8 }]) {
+    const { api, calls, original } = paginationTrial(options);
+    assert.equal(calls.length, 1); assert.deepEqual(api.state.pages.slice(1), original);
+  }
+});
+
+test('쪽수가 그대로거나 오류, 넘침, 예외가 생긴 촘촘한 시안은 버리고 원래 쪽과 오류를 복원한다', () => {
+  for (const options of [{ compactCount: 2 }, { compactCount: 3 }, { trialFailure: true }, { overflow: true }, { negativeHeight: true }, { throws: true }]) {
+    const { api, calls, original } = paginationTrial({ ...options, originalFailure: true });
+    assert.equal(calls.length, 2); assert.deepEqual(api.state.pages.slice(1), original);
+    assert.deepEqual(api.state.failures, ['이전 기사 오류', '기존 오류']);
+  }
 });
 
 // Exercise the asynchronous image pipeline with in-memory image/canvas/fetch
