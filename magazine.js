@@ -45,21 +45,41 @@
     catch (error) { return ''; }
   }
   function parseFigure(value) {
+    // Read the closing parenthesis as a balanced pair: signed URLs and data
+    // images may contain parentheses of their own.
+    value = value.trim();
+    var markdown = value.match(/^!\[([^\]]*)\]\(/);
+    if (markdown) {
+      var start = markdown[0].length, depth = 1, end = start;
+      for (; end < value.length; end += 1) {
+        var ch = value[end];
+        if (ch === '(') depth += 1;
+        if (ch === ')' && --depth === 0) break;
+      }
+      if (!depth) {
+        var rest = value.slice(end + 1).trim();
+        if (!rest || rest[0] === '|') return { src: safeImageURL(value.slice(start, end)), caption: undecorate(rest ? rest.slice(1) : markdown[1]) };
+      }
+    }
     var separator = value.indexOf('|');
     var address = separator < 0 ? value.trim() : value.slice(0, separator).trim();
     var looksLikeURL = /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(address);
     return { src: safeImageURL(address), caption: undecorate(separator >= 0 ? value.slice(separator + 1) : looksLikeURL ? '' : address) };
   }
+  function figureLine(line) {
+    if (/^!\[[^\]]*\]\(/.test(line)) return parseFigure(line);
+    var kv = keyValue(line);
+    return kv && ARTICLE_KEYS[kv.key] === 'hero' ? parseFigure(kv.value) : null;
+  }
   function isSources(line) { return /^(?:#{1,3}\s*)?(?:\[출처\]|출처\s*[:：]?|참고 자료\s*[:：]?)\s*$/.test(undecorate(line)); }
   function isNote(line) { return /^\[취재 노트\]\s*$/.test(undecorate(line)); }
   function isSpecial(line) {
-    var kv = keyValue(line);
-    return /^(?:#{1,3}\s+|>\s*|\[상자\])/.test(line) || isNote(line) || isSources(line) || !!(kv && ARTICLE_KEYS[kv.key] === 'hero');
+    return /^(?:#{1,3}\s+|>\s*|\[상자\]|\[쉽게 보기\])/.test(undecorate(line)) || isNote(line) || isSources(line) || !!figureLine(line);
   }
   function parseArticle(text) {
     var article = { kind: 'article', section: '', title: '', subtitle: '', author: '', hero: null,
       authorNote: '', blocks: [], notes: [], sources: [] };
-    var lines = linesOf(text), header = true, mode = '', box = null, sourceMap = {};
+    var lines = linesOf(text), header = true, mode = '', box = null, easy = null, sourceMap = {};
     function addSource(source) {
       var normalized = undecorate(source).replace(/\s+/g, ' ').trim();
       if (!normalized) return 0;
@@ -70,7 +90,13 @@
     lines.forEach(function (raw) {
       var line = raw.trim();
       if (/^```/.test(line)) return;
-      if (!line) { if (mode === 'box' || mode === 'notes') mode = ''; box = null; return; }
+      if (!line) { if (mode === 'box' || mode === 'notes' || mode === 'easy') mode = ''; box = null; easy = null; return; }
+      var picture = figureLine(line);
+      if (mode === 'easy' && picture) { easy.panels.push(picture); return; }
+      if (/^\[쉽게 보기\]/.test(undecorate(line))) {
+        easy = { type: 'easy', title: undecorate(line).replace(/^\[쉽게 보기\]\s*/, ''), panels: [] };
+        article.blocks.push(easy); mode = 'easy'; header = false; return;
+      }
       if (isSources(line)) { mode = 'sources'; header = false; return; }
       if (isNote(line)) { mode = 'notes'; header = false; return; }
       if (/^\[상자\]/.test(undecorate(line))) {
@@ -89,13 +115,14 @@
         box.lines.push({ bullet: /^-\s/.test(line), text: cleanText(line.replace(/^-\s+/, '')) }); return;
       }
       mode = '';
+      if (header && picture && !article.hero) { article.hero = picture; return; }
       if (header && key) {
         if (key === 'hero') {
           if (!article.hero) { article.hero = parseFigure(kv.value); return; }
         } else { article[key] = kv.value; return; }
       }
       header = false;
-      if (key === 'hero') article.blocks.push(Object.assign({ type: 'figure' }, parseFigure(kv.value)));
+      if (picture) article.blocks.push(Object.assign({ type: 'figure' }, picture));
       else if (/^#{1,3}\s+/.test(line)) article.blocks.push({ type: 'heading', text: cleanText(line.replace(/^#{1,3}\s+/, '')) });
       else if (/^>/.test(line)) article.blocks.push({ type: 'quote', text: cleanText(line.replace(/^>\s*/, '')) });
       else { var body = cleanText(line); if (body) article.blocks.push({ type: 'paragraph', text: body }); }
@@ -138,6 +165,7 @@
     linesOf(text).forEach(function (raw) {
       var line = raw.trim();
       if (!line || /^```/.test(line)) return;
+      if (/^!\[[^\]]*\]\(/.test(line)) { cover.hero = parseFigure(line); principles = false; return; }
       var kv = keyValue(line);
       if (kv && kv.key === 'AI 원칙') { principles = true; if (kv.value) cover.principles.push(kv.value); return; }
       if (kv && kv.key === '꼭지 이름') {
@@ -158,9 +186,11 @@
 
   var resolveReady;
   var api = { ready: new Promise(function (resolve) { resolveReady = resolve; }), parseArticle: parseArticle, parseCover: parseCover,
+    get imagesReady() { return api.ready.then(function () { return state.queue; }).then(waitForImages); },
     audit: audit, add: add, render: render };
   var browser = typeof document !== 'undefined' && typeof window !== 'undefined';
   var state = { pieces: [], pages: [], failures: [], bleed: false, sequence: 0, mounted: false, queue: Promise.resolve(), cover: null, fontStyles: Promise.resolve() };
+  var imageJobs = new WeakMap(), imageCache = new Map(), imagePending = new Set(), figureViews = new Map(), unsavedImages = new WeakSet();
   var stage, status, message, orderPanel, fileInput, printStyle;
   var scriptURL = browser && document.currentScript ? document.currentScript.src || 'magazine.js' : 'magazine.js';
 
@@ -178,6 +208,17 @@
   function articleChars(article) {
     return article.blocks.map(function (block) { return block.text || (block.lines || []).map(function (line) { return line.text; }).join(''); }).join('').replace(/\[\d+\]/g, '').length;
   }
+  function easyGroups(article) { return (article.blocks || []).filter(function (block) { return block.type === 'easy'; }); }
+  function easyPanelCount(article) { return easyGroups(article).reduce(function (count, group) { return count + group.panels.length; }, 0); }
+  function pieceFigures(piece) {
+    var figures = piece.hero ? [{ model: piece.hero, limit: 1600 }] : [];
+    (piece.blocks || []).forEach(function (block) {
+      if (block.type === 'figure') figures.push({ model: block, limit: 900 });
+      if (block.type === 'easy') block.panels.forEach(function (panel) { figures.push({ model: panel, limit: 900 }); });
+    });
+    return figures;
+  }
+  function hasArticleImages(article) { return pieceFigures(article).some(function (entry) { return !!safeImageURL(entry.model.src); }); }
   function inline(node, value, citations) {
     var pattern = citations === false ? /(https:\/\/[^\s<>]+)/g : /\[(\d+)\]/g;
     var last = 0, match;
@@ -229,7 +270,7 @@
     .qm-subtitle { margin:3mm 0; font:12pt/1.55 'Pretendard Variable',sans-serif; color:#50584e; }
     .qm-byline { margin:3mm 0 5mm; font:8.5pt/1.5 'Pretendard Variable',sans-serif; }
     .qm-article-head { padding-bottom:4mm; }
-    .qm-columns { column-count:2; column-gap:7mm; column-fill:auto; width:100%; text-align:justify; }
+    .qm-columns { column-count:2; column-gap:7mm; column-fill:auto; width:100%; text-align:left; }
     .qm-columns > p { margin:0 0 3mm; orphans:2; widows:2; }
     .qm-columns .qm-continuation { text-indent:0; }
     .qm-heading { font-size:12pt; line-height:1.45; margin:4mm 0 2mm; break-after:avoid; break-inside:avoid; color:var(--qm-color); }
@@ -242,8 +283,18 @@
     .qm-image-frame img[hidden] { display:none; }
     .qm-figure[data-empty='true'] .qm-image-frame,.qm-figure[data-broken='true'] .qm-image-frame { background:repeating-linear-gradient(135deg,#eef0eb 0,#eef0eb 3mm,#e3e7df 3mm,#e3e7df 3.5mm); }
     .qm-image-help { position:absolute; inset:0; display:flex; flex-direction:column; justify-content:center; align-items:center; padding:5mm; gap:3mm; text-align:center; font:10pt/1.6 'Pretendard Variable',sans-serif; color:#3d4b38; }
+    .qm-image-help[hidden] { display:none; }
     .qm-image-help .qm-screen-only { font-size:16px; }
     .qm-figure figcaption { font-size:7.5pt; line-height:1.55; margin-top:1.5mm; }
+    .qm-easy-bottom { position:absolute; inset:auto 0 0; }
+    .qm-easy-strip { height:85mm; padding-bottom:5mm; break-inside:avoid; }
+    .qm-easy-strip h3 { margin:0 0 3mm; color:var(--qm-color); font:700 12pt/1.4 'Pretendard Variable',sans-serif; }
+    .qm-easy-panels { display:grid; gap:4mm; align-items:start; }
+    .qm-easy-panels .qm-figure { margin:0; min-width:0; }
+    .qm-easy-panels .qm-image-frame { aspect-ratio:1; max-width:52mm; margin-inline:auto; }
+    .qm-easy-panels figcaption { font:700 12pt/1.35 'Pretendard Variable',sans-serif; text-align:center; }
+    .qm-easy-panels .qm-image-help { padding:2mm; gap:1mm; font-size:9pt; }
+    .qm-easy-panels .qm-screen-only { font-size:9pt; }
     .qm-quote { break-inside:avoid; color:var(--qm-color); font-size:13pt; line-height:1.6; border-block:1px solid currentColor; padding:4mm 0; margin:3mm 0 5mm; text-align:left; }
     .qm-box { break-inside:avoid; background:var(--qm-tint); padding:4mm; margin:0 0 4mm; font-size:8.5pt; line-height:1.65; text-align:left; }
     .qm-box h3 { margin:0 0 2mm; font-size:10pt; color:var(--qm-color); }
@@ -253,17 +304,26 @@
     .qm-source.qm-continuation { list-style:none; }
     .qm-source a { color:inherit; text-decoration-thickness:1px; text-underline-offset:2px; }
     .qm-cover { --qm-color:#1f5f8b; }
-    .qm-cover .qm-inner { display:flex; flex-direction:column; }
+    .qm-cover .qm-inner { display:flex; flex-direction:column; z-index:2; pointer-events:none; }
+    .qm-cover::before { content:''; position:absolute; inset:0; z-index:1; pointer-events:none; background:linear-gradient(to bottom,#fff 0%,rgba(255,255,255,.95) 22%,rgba(255,255,255,.1) 46%,#fff 68%); }
+    .qm-cover[data-orientation='portrait']::before { background:linear-gradient(to bottom,rgba(255,255,255,.98) 0%,rgba(255,255,255,.9) 23%,rgba(255,255,255,.08) 43%,rgba(255,255,255,.95) 70%,#fff 100%); }
     .qm-cover-name { color:var(--qm-color); font-size:43pt !important; line-height:1.15 !important; margin:3mm 0 5mm !important; }
     .qm-cover-english { font:700 10pt/1.4 'Pretendard Variable',sans-serif; letter-spacing:.08em; margin:0; }
     .qm-cover-meta { font:10pt/1.7 'Pretendard Variable',sans-serif; margin:0 0 8mm; }
-    .qm-cover .qm-figure { margin:5mm calc(-16mm - var(--qm-bleed)); }
-    .qm-cover .qm-image-frame { height:96mm; aspect-ratio:auto; }
+    .qm-cover > .qm-figure { position:absolute; inset:0 0 auto; height:66.6667%; margin:0; }
+    .qm-cover[data-orientation='portrait'] > .qm-figure { height:100%; }
+    .qm-cover .qm-image-frame { height:100%; aspect-ratio:auto; }
+    .qm-cover .qm-image-frame:focus-visible { outline-offset:-4px; }
     .qm-cover .qm-image-help { padding-inline:calc(12mm + var(--qm-bleed)); }
-    .qm-cover .qm-figure figcaption { margin-left:calc(16mm + var(--qm-bleed)); margin-right:calc(16mm + var(--qm-bleed)); }
-    .qm-cover-question { font-size:22pt; line-height:1.4; margin:5mm 0; }
-    .qm-cover-tagline { margin-top:auto; padding-top:5mm; font-size:12pt; line-height:1.7; }
-    .qm-cover-strip { position:absolute; inset:0 0 auto; height:5mm; background:var(--qm-color); }
+    .qm-cover-caption { margin:0; font-size:7.5pt; }
+    .qm-cover-questions { margin-top:auto; padding-top:5mm; }
+    .qm-cover-questions h2 { font-size:12pt; margin:0 0 3mm; }
+    .qm-cover-question,.qm-cover-item { display:flex; align-items:baseline; gap:3mm; margin:2mm 0; font-family:'Pretendard Variable',sans-serif; }
+    .qm-cover-question { font-size:22pt; line-height:1.35; }
+    .qm-cover-item { font-size:12pt; line-height:1.4; }
+    .qm-question-dot { flex:none; width:2.5mm; height:2.5mm; border-radius:50%; background:var(--qm-color); }
+    .qm-cover-tagline { margin:0; padding-top:4mm; font-size:11pt; line-height:1.5; }
+    .qm-cover-strip { position:absolute; inset:0 0 auto; z-index:3; height:5mm; background:var(--qm-color); }
     .qm-flow { height:100%; }
     .qm-toc-group { font:700 12pt/1.5 'Pretendard Variable',sans-serif; color:var(--qm-color); margin:6mm 0 3mm; break-after:avoid; }
     .qm-toc-row { display:grid; grid-template-columns:minmax(0,1fr) 18mm; gap:5mm; padding:3mm 0; border-bottom:1px solid #dce0d7; break-inside:avoid; }
@@ -327,39 +387,160 @@
       var reader = new FileReader(); reader.onload = function () { resolve(String(reader.result)); }; reader.onerror = function () { reject(new Error('그림 파일을 읽지 못했습니다.')); }; reader.readAsDataURL(file);
     });
   }
-  async function replaceFigure(model, file) {
-    if (!file) return;
-    var mime = file.type || ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', svg: 'image/svg+xml', webp: 'image/webp', gif: 'image/gif', avif: 'image/avif' })[file.name.split('.').pop().toLowerCase()];
-    if (!mime || !/^image\//.test(mime)) { announce('그림 파일을 골라 주세요.'); return; }
-    try {
-      var url = safeImageURL(await readImage(file.slice(0, file.size, mime)));
-      if (!url) throw new Error('이 그림 형식은 넣을 수 없습니다.');
-      model.src = url; await render(); announce('그림을 넣었습니다.');
-    } catch (error) { announce(error.message); }
+  function trackImage(promise) {
+    imagePending.add(promise);
+    promise.then(function () { imagePending.delete(promise); }, function () { imagePending.delete(promise); });
+    return promise;
+  }
+  async function waitForImages() {
+    // Include work added while an earlier batch was still running.
+    while (imagePending.size) await Promise.all(Array.from(imagePending));
+  }
+  function shrinkImage(src, limit) {
+    return new Promise(function (resolve, reject) {
+      var image = new Image(), timer = setTimeout(function () { finish(new Error('그림을 읽지 못했습니다. 다른 그림을 골라 주세요.')); }, 8000);
+      function finish(error, url) { clearTimeout(timer); image.onload = null; image.onerror = null; if (error) reject(error); else resolve(url); }
+      image.onerror = function () { finish(new Error('그림을 읽지 못했습니다. 다른 그림을 골라 주세요.')); };
+      image.onload = function () {
+        try {
+          if (!image.naturalWidth || !image.naturalHeight) throw new Error('그림 크기를 읽지 못했습니다.');
+          var ratio = Math.min(1, limit / Math.max(image.naturalWidth, image.naturalHeight)), canvas = element('canvas');
+          canvas.width = Math.max(1, Math.round(image.naturalWidth * ratio)); canvas.height = Math.max(1, Math.round(image.naturalHeight * ratio));
+          var context = canvas.getContext('2d'); if (!context) throw new Error('그림을 바꾸지 못했습니다. 다시 골라 주세요.');
+          context.fillStyle = '#fff'; context.fillRect(0, 0, canvas.width, canvas.height); context.drawImage(image, 0, 0, canvas.width, canvas.height);
+          var url = canvas.toDataURL('image/jpeg', .85);
+          if (!/^data:image\/jpeg[,;]/i.test(url)) throw new Error('그림을 바꾸지 못했습니다. 다시 골라 주세요.');
+          finish(null, url);
+        } catch (error) { finish(error); }
+      };
+      image.src = src;
+    });
+  }
+  function fetchImage(src, limit) {
+    var key = limit + ':' + src;
+    if (!imageCache.has(key)) imageCache.set(key, (async function () {
+      var controller = new AbortController(), timer = setTimeout(function () { controller.abort(); }, 8000);
+      try {
+        var response = await fetch(src, { credentials: 'omit', referrerPolicy: 'no-referrer', signal: controller.signal });
+        if (!response.ok || !safeImageURL(response.url)) throw new Error('그림 주소를 열지 못했습니다.');
+        var blob = await response.blob(); if (!/^image\//i.test(blob.type)) throw new Error('그림 주소를 확인해 주세요.');
+        return await shrinkImage(await readImage(blob), limit);
+      } finally { clearTimeout(timer); }
+    }()).catch(function (error) { imageCache.delete(key); throw error; }));
+    return imageCache.get(key);
+  }
+  function updateFigureViews(model) {
+    return Promise.all(Array.from(figureViews.get(model) || []).filter(function (view) { return view.figure.isConnected; }).map(function (view) { return view.update(); }));
+  }
+  function prepareImages(retry) {
+    state.pieces.forEach(function (piece) { pieceFigures(piece).forEach(function (entry) {
+      var model = entry.model, src = safeImageURL(model.src), previous = imageJobs.get(model);
+      if (!/^https:/i.test(src) || previous && previous.src === src && (previous.pending || !retry)) return;
+      unsavedImages.add(model);
+      var job = { src: src, pending: true }; imageJobs.set(model, job);
+      job.promise = trackImage((async function () {
+        var url = null;
+        try { url = await fetchImage(src, entry.limit); } catch (error) { /* Keep the original address for display and saving. */ }
+        job.pending = false;
+        if (imageJobs.get(model) !== job || model.src !== src) return;
+        if (url) model.src = url;
+        await updateFigureViews(model); refreshStatus();
+      }()));
+    }); });
+  }
+  function htmlAttribute(attrs, name) {
+    var pattern = /(?:^|\s)([^\s"'=<>`]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g, match;
+    while ((match = pattern.exec(attrs))) { if (match[1].toLowerCase() === name.toLowerCase()) return match[2] || match[3] || match[4] || ''; }
+    return '';
+  }
+  function droppedImageURL(transfer) {
+    var addresses = transfer.getData('text/uri-list').split(/\r?\n/).filter(function (line) { return line.trim()[0] !== '#'; });
+    // Read just img/src without constructing an HTML document or loading any of
+    // its resources. Decode URL attribute entities without inserting user HTML.
+    var html = transfer.getData('text/html'), tags = /<!--[\s\S]*?-->|<script\b[^>]*>[\s\S]*?<\/script\s*>|<img\b((?:"[^"]*"|'[^']*'|[^'">])*)>/gi, match;
+    while ((match = tags.exec(html))) {
+      if (match[1] == null) continue;
+      addresses.push(htmlAttribute(match[1], 'src').replace(/&(?:amp|quot|apos|lt|gt|#\d+|#x[0-9a-f]+);/gi, function (entity) {
+        var named = { '&amp;': '&', '&quot;': '"', '&apos;': "'", '&lt;': '<', '&gt;': '>' }, lower = entity.toLowerCase();
+        if (named[lower]) return named[lower];
+        var number = lower[2] === 'x' ? parseInt(lower.slice(3, -1), 16) : Number(lower.slice(2, -1));
+        return number > 0 && number <= 0x10ffff ? String.fromCodePoint(number) : '';
+      }));
+    }
+    return addresses.map(safeImageURL).find(function (url) { return /^https:/i.test(url); }) || '';
+  }
+  function replaceFigure(model, input, limit) {
+    if (!input) return Promise.resolve();
+    // Changing the job token also prevents a slow earlier fetch/drop from
+    // overwriting the picture most recently chosen for this slot.
+    var token = { src: model.src, pending: true }; imageJobs.set(model, token);
+    return trackImage((async function () {
+      try {
+        var external = typeof input === 'string', url;
+        if (external) {
+          var src = safeImageURL(input);
+          if (!/^https:/i.test(src)) throw new Error('https 그림 주소를 골라 주세요.');
+          url = await fetchImage(src, limit);
+        } else {
+          var mime = input.type || ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', svg: 'image/svg+xml', webp: 'image/webp', gif: 'image/gif', avif: 'image/avif' })[(input.name || '').split('.').pop().toLowerCase()];
+          if (!mime || !/^image\//.test(mime)) throw new Error('그림 파일을 골라 주세요.');
+          url = await shrinkImage(await readImage(input.slice(0, input.size, mime)), limit);
+        }
+        if (imageJobs.get(model) !== token) return;
+        model.src = url; token.pending = false;
+        if (external) unsavedImages.add(model); else unsavedImages.delete(model);
+        await updateFigureViews(model);
+        // Only the attribution changes; fixed image frames need no repagination.
+        updateBylines(); refreshStatus(); announce('그림을 넣었습니다.');
+      } catch (error) {
+        token.pending = false;
+        if (imageJobs.get(model) === token) { await updateFigureViews(model); refreshStatus(); announce('그림을 넣지 못했습니다. 그림 파일을 골라 다시 넣어 주세요.'); }
+      }
+    }()));
   }
   function figureNode(model, hero) {
     var figure = element('figure', 'qm-figure' + (hero ? ' qm-hero' : ''));
     var frame = element('div', 'qm-image-frame');
-    var src = safeImageURL(model.src); figure.dataset.empty = String(!src);
+    var limit = hero ? 1600 : 900;
     frame.tabIndex = 0; frame.setAttribute('role', 'button'); frame.setAttribute('aria-label', (model.caption || '그림') + ' — 그림 고르기');
     function choose() {
       var input = element('input'); input.type = 'file'; input.accept = 'image/*';
-      input.addEventListener('change', function () { replaceFigure(model, input.files[0]); }); input.click();
+      input.addEventListener('change', function () { replaceFigure(model, input.files[0], limit); }); input.click();
     }
     frame.addEventListener('click', choose);
     frame.addEventListener('keydown', function (event) { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); choose(); } });
     frame.addEventListener('dragover', function (event) { event.preventDefault(); event.stopPropagation(); });
-    frame.addEventListener('drop', function (event) { event.preventDefault(); event.stopPropagation(); replaceFigure(model, event.dataTransfer.files[0]); });
+    frame.addEventListener('drop', function (event) {
+      event.preventDefault(); event.stopPropagation();
+      var transfer = event.dataTransfer, input = transfer.files[0] || droppedImageURL(transfer);
+      if (input) replaceFigure(model, input, limit); else announce('그림 파일이나 다른 탭의 https 그림을 끌어다 놓아 주세요.');
+    });
     var help = element('div', 'qm-image-help');
     help.appendChild(element('span', '', model.caption || '그림 자리'));
-    help.appendChild(element('span', 'qm-screen-only', '그림 파일을 여기에 끌어다 놓거나 눌러서 고르세요.'));
-    if (src) {
-      var img = element('img'); img.alt = model.caption; img.referrerPolicy = 'no-referrer';
-      img.addEventListener('error', function () { figure.dataset.broken = 'true'; img.hidden = true; frame.appendChild(help); refreshStatus(); });
-      img.addEventListener('load', refreshStatus); img.src = src; frame.appendChild(img);
-    } else frame.appendChild(help);
+    var hint = element('span', 'qm-screen-only', '그림 파일이나 다른 탭의 그림을 여기에 끌어다 놓으세요. 눌러서 골라도 됩니다.'); help.appendChild(hint);
+    var img = element('img'); img.alt = model.caption; img.referrerPolicy = 'no-referrer'; img.hidden = true;
+    function loaded() {
+      figure.dataset.broken = 'false'; img.hidden = false; help.hidden = true;
+      var paper = figure.closest('.qm-cover');
+      if (paper) paper.dataset.orientation = img.naturalHeight > img.naturalWidth ? 'portrait' : 'landscape';
+      refreshStatus();
+    }
+    img.addEventListener('error', function () { figure.dataset.broken = 'true'; img.hidden = true; help.hidden = false; refreshStatus(); });
+    img.addEventListener('load', loaded);
+    frame.appendChild(img); frame.appendChild(help);
     figure.appendChild(frame);
     if (model.caption) figure.appendChild(element('figcaption', '', model.caption));
+    var view = { figure: figure, update: function () {
+      var src = safeImageURL(model.src), job = imageJobs.get(model), pending = job && job.pending && job.src === src;
+      figure.dataset.empty = String(!src); figure.dataset.broken = 'false';
+      hint.textContent = pending ? '그림을 불러오고 있습니다.' : '그림 파일이나 다른 탭의 그림을 여기에 끌어다 놓으세요. 눌러서 골라도 됩니다.';
+      if (!src || pending) { img.hidden = true; img.removeAttribute('src'); help.hidden = false; return Promise.resolve(); }
+      img.src = src;
+      // Wait only on the image path; draw()/ready never await this promise.
+      return typeof img.decode === 'function' ? img.decode().then(loaded, function () {}) : Promise.resolve();
+    } };
+    if (!figureViews.has(model)) figureViews.set(model, new Set()); figureViews.get(model).add(view);
+    trackImage(view.update());
     return figure;
   }
   function blockNode(block) {
@@ -403,7 +584,34 @@
     });
   }
   function fits(columns) { keepHeadings(columns); return !overflows(columns); }
-  function articlePage(article, first, firstPart) {
+  function bylineText(article) { return '글 ' + (article.author || '익명') + (hasArticleImages(article) ? ' · 그림 AI 생성' : ''); }
+  function updateBylines() {
+    state.pages.forEach(function (page) { var node = page.piece && page.inner.querySelector('.qm-byline'); if (node) node.textContent = bylineText(page.piece); });
+  }
+  function easyNode(groups, bottom) {
+    var wrapper = element('div', bottom ? 'qm-easy-bands qm-easy-bottom' : 'qm-easy-bands');
+    groups.forEach(function (group) {
+      var strip = element('aside', 'qm-easy-strip');
+      strip.appendChild(element('h3', '', group.title || '쉽게 보기'));
+      var panels = element('div', 'qm-easy-panels'); panels.style.gridTemplateColumns = 'repeat(' + Math.max(1, group.panels.length) + ',minmax(0,1fr))';
+      group.panels.forEach(function (panel, index) {
+        var figure = figureNode(panel, false), caption = figure.querySelector('figcaption');
+        if (!caption) { caption = element('figcaption'); figure.appendChild(caption); }
+        caption.textContent = (['①', '②', '③', '④'][index] || '(' + (index + 1) + ')') + (panel.caption ? ' ' + panel.caption : ''); panels.appendChild(figure);
+      });
+      strip.appendChild(panels); wrapper.appendChild(strip);
+    });
+    return wrapper;
+  }
+  function sizeArticleColumns(page) {
+    var head = page.inner.querySelector('.qm-article-head');
+    page.bodyHeight = page.inner.clientHeight - (head ? head.offsetHeight : 0) - (page.easy ? page.easy.offsetHeight : 0);
+    page.columns.style.height = Math.max(0, page.bodyHeight) + 'px';
+  }
+  function attachEasy(page, groups, bottom) {
+    page.easy = easyNode(groups, bottom); page.inner.insertBefore(page.easy, page.columns); sizeArticleColumns(page);
+  }
+  function articlePage(article, first, firstPart, groups) {
     var page = makePage('article', article, first ? '' : state.cover.name + ' · ' + (article.section || '질문'));
     var head;
     if (first) {
@@ -412,15 +620,16 @@
       head.appendChild(element('div', 'qm-band', firstPart && part ? part + '  ' + sectionName(article.section) : article.section || '질문'));
       var title = element('h1', '', article.title || '제목 없는 기사'); head.appendChild(title);
       if (article.subtitle) head.appendChild(element('p', 'qm-subtitle', article.subtitle));
-      head.appendChild(element('p', 'qm-byline', '글 ' + (article.author || '익명') + (article.hero ? ' · 그림 AI 생성' : '')));
+      head.appendChild(element('p', 'qm-byline', bylineText(article)));
       if (article.hero) head.appendChild(figureNode(article.hero, true));
       page.inner.appendChild(head);
       // Only reduce within the title range specified in SPEC, never shrink body type.
       if (title.offsetHeight > 115) title.style.fontSize = '26pt';
     }
     var columns = element('div', 'qm-columns'); page.inner.appendChild(columns);
-    columns.style.height = Math.max(0, page.inner.clientHeight - (head ? head.offsetHeight : 0)) + 'px';
-    page.columns = columns; return page;
+    page.columns = columns;
+    if (groups && groups.length) attachEasy(page, groups, false); else sizeArticleColumns(page);
+    return page;
   }
   function splitParagraph(block, columns, pendingHeading) {
     // Keep exact separators: concatenating fragments reconstructs the original.
@@ -448,14 +657,14 @@
     return { head: words.slice(0, best).join(''), tail: words.slice(best).join('') };
   }
   function renderArticle(article, firstPart) {
-    var blocks = article.blocks.slice();
+    var groups = easyGroups(article), blocks = article.blocks.filter(function (block) { return block.type !== 'easy'; });
     if (article.notes.length) blocks.push({ type: 'notes', title: '취재 노트', lines: article.notes.map(function (note) { return { text: note.key + ': ' + note.value, bullet: false }; }) });
     if (article.sources.length) {
       blocks.push({ type: 'heading', text: '출처' });
       article.sources.forEach(function (text, index) { blocks.push({ type: 'source', text: text, number: index + 1 }); });
     }
-    var page = articlePage(article, true, firstPart), pending = [];
-    function nextPage() { page = articlePage(article, false, false); }
+    var page = articlePage(article, true, firstPart), firstPage = page, pageCount = 1, pending = [];
+    function nextPage() { pageCount += 1; page = articlePage(article, false, false, pageCount === 2 ? groups : null); }
     function attachHeadings() { return pending.map(function (heading) { var node = blockNode(heading); page.columns.appendChild(node); return node; }); }
     for (var i = 0; i < blocks.length; i += 1) {
       var block = blocks[i];
@@ -470,7 +679,7 @@
         pending = []; blocks[i] = Object.assign({}, block, { text: fragment.tail, continuation: true }); nextPage(); i -= 1; continue;
       }
       headings.forEach(function (heading) { page.columns.removeChild(heading); });
-      if (page.columns.children.length || page.inner.querySelector('.qm-article-head')) { nextPage(); i -= 1; continue; }
+      if (page.columns.children.length || page.inner.querySelector('.qm-article-head') || page.easy) { nextPage(); i -= 1; continue; }
       // An indivisible block taller than a whole column cannot satisfy the spec.
       // Preserve it and report it; never silently drop text or loop forever.
       attachHeadings(); page.columns.appendChild(node); pending = [];
@@ -481,6 +690,14 @@
       attachHeadings();
       if (overflows(page.columns)) state.failures.push((article.title || '제목 없는 기사') + ': 마지막 소제목이 넘칩니다.');
     }
+    if (groups.length && pageCount === 1) {
+      // Test the complete one-page article with the bottom band reserved. If it
+      // no longer fits, keep the article intact and put the band on a new page.
+      attachEasy(firstPage, groups, true);
+      if (!fits(firstPage.columns) || firstPage.bodyHeight < 0) {
+        firstPage.easy.remove(); firstPage.easy = null; sizeArticleColumns(firstPage); keepHeadings(firstPage.columns); nextPage();
+      }
+    }
   }
 
   function orderedArticles() {
@@ -489,13 +706,31 @@
     articles.forEach(function (piece) { if (sections.indexOf(piece.section) === -1) sections.push(piece.section); });
     return sections.reduce(function (all, section) { return all.concat(articles.filter(function (piece) { return piece.section === section; })); }, []);
   }
-  function renderCover(cover) {
+  function coverQuestions(cover, articles) {
+    var featured = articles.find(function (article) { return article.title === cover.question; }) || articles[0];
+    return (featured ? [featured].concat(articles.filter(function (article) { return article !== featured; })) : []).slice(0, 5);
+  }
+  function renderCover(cover, articles) {
     var page = makePage('cover'); page.paper.appendChild(element('div', 'qm-cover-strip'));
+    if (cover.hero) {
+      var artwork = figureNode(cover.hero, true), caption = artwork.querySelector('figcaption');
+      if (caption) caption.remove(); page.paper.insertBefore(artwork, page.inner);
+    }
     page.inner.appendChild(element('p', 'qm-cover-english', cover.english));
     page.inner.appendChild(element('h1', 'qm-cover-name', cover.name));
     page.inner.appendChild(element('p', 'qm-cover-meta', [cover.issue, cover.school].filter(Boolean).join(' | ')));
-    if (cover.hero) page.inner.appendChild(figureNode(cover.hero, true));
-    if (cover.question) page.inner.appendChild(element('h3', 'qm-cover-question', cover.question));
+    if (cover.hero && cover.hero.caption) page.inner.appendChild(element('p', 'qm-cover-caption', cover.hero.caption));
+    var questions = element('section', 'qm-cover-questions'); questions.appendChild(element('h2', '', '이번 호 질문'));
+    var selected = coverQuestions(cover, articles);
+    var customQuestion = cover.question && !selected.some(function (article) { return article.title === cover.question; });
+    if (customQuestion) questions.appendChild(element('h3', 'qm-cover-question', cover.question));
+    selected.forEach(function (article, index) {
+      var primary = index === 0 && !customQuestion;
+      var row = element(primary ? 'h3' : 'p', primary ? 'qm-cover-question' : 'qm-cover-item');
+      var dot = element('span', 'qm-question-dot'); dot.style.setProperty('--qm-color', sectionColor(article.section)); dot.setAttribute('aria-hidden', 'true');
+      row.appendChild(dot); row.appendChild(element('span', '', article.title || '제목 없는 기사')); questions.appendChild(row);
+    });
+    page.inner.appendChild(questions);
     if (cover.tagline) page.inner.appendChild(element('p', 'qm-cover-tagline', cover.tagline));
     page.paper.querySelector('.qm-folio').hidden = true;
   }
@@ -512,7 +747,7 @@
     articles.forEach(function (article) {
       var group = article.section !== current ? element('h3', 'qm-toc-group', (article.section === '사회과학' ? 'PART 1  ' : article.section === '자연과학' ? 'PART 2  ' : '') + sectionName(article.section)) : null;
       var row = element('div', 'qm-toc-row'), label = element('div');
-      label.appendChild(element('strong', '', article.title || '제목 없는 기사')); label.appendChild(element('small', '', article.author || '익명'));
+      label.appendChild(element('strong', '', article.title || '제목 없는 기사')); label.appendChild(element('small', '', (article.author || '익명') + (easyPanelCount(article) ? ' / 쉽게 보기 ' + easyPanelCount(article) + '컷' : '')));
       row.appendChild(label); var number = element('span', 'qm-toc-number', '000–000'); number.dataset.articleId = article.id; row.appendChild(number);
       if (group) page.flow.appendChild(group); page.flow.appendChild(row);
       if (overflows(page.flow)) {
@@ -566,7 +801,7 @@
   }
   async function draw() {
     if (!state.mounted) return;
-    stage.classList.add('qm-measuring'); clear(stage); state.pages = []; state.failures = [];
+    stage.classList.add('qm-measuring'); clear(stage); figureViews.clear(); state.pages = []; state.failures = [];
     document.documentElement.style.setProperty('--qm-bleed', state.bleed ? '3mm' : '0mm');
     document.documentElement.style.setProperty('--qm-width', state.bleed ? '216mm' : '210mm');
     document.documentElement.style.setProperty('--qm-height', state.bleed ? '303mm' : '297mm');
@@ -575,10 +810,10 @@
     // whose face has not yet been used by a previous render.
     await state.fontStyles;
     if (document.fonts) {
-      var glyphs = '질문 잡지 차례 이어서 계속 기자의 말 출처 취재 노트 독자 질문함 메모 질문을 모은 사람들 사람과 사회의 물음표 몸과 자연의 물음표 그 밖의 질문 AI 사용 원칙 이 잡지는 마주온 에이전트 질문을 학교 잡지로 함께 만들었습니다. 글 그림 AI 생성 익명 제목 없는 기사 다음 호에서 함께 살펴볼 질문을 적어 주세요. 일상에서 궁금했던 일도 좋습니다. 그림 파일을 여기에 끌어다 놓거나 눌러서 고르세요. PART 1 PART 2' + DEFAULT_RULES.join('') + state.pieces.map(function (piece) {
+      var glyphs = '질문 잡지 이번 호 질문 쉽게 보기 ①②③④ 차례 이어서 계속 기자의 말 출처 취재 노트 독자 질문함 메모 질문을 모은 사람들 사람과 사회의 물음표 몸과 자연의 물음표 그 밖의 질문 AI 사용 원칙 이 잡지는 마주온 에이전트 질문을 학교 잡지로 함께 만들었습니다. 글 그림 AI 생성 익명 제목 없는 기사 다음 호에서 함께 살펴볼 질문을 적어 주세요. 일상에서 궁금했던 일도 좋습니다. 그림 파일이나 다른 탭의 그림을 여기에 끌어다 놓으세요. 눌러서 골라도 됩니다. 그림을 불러오고 있습니다. 컷 PART 1 PART 2' + DEFAULT_RULES.join('') + state.pieces.map(function (piece) {
         return [piece.title, piece.name, piece.section, piece.subtitle, piece.author, piece.authorNote, piece.tagline, piece.question, piece.english, piece.issue, piece.school, piece.date, piece.hero && piece.hero.caption]
           .concat(Object.keys(piece.sectionNames || {}).map(function (section) { return section + piece.sectionNames[section]; }))
-          .concat((piece.blocks || []).map(function (block) { return [block.text, block.caption, block.title].filter(Boolean).join('') + (block.lines || []).map(function (line) { return line.text; }).join(''); }))
+          .concat((piece.blocks || []).map(function (block) { return [block.text, block.caption, block.title].filter(Boolean).join('') + (block.lines || []).map(function (line) { return line.text; }).join('') + (block.panels || []).map(function (panel) { return panel.caption; }).join(''); }))
           .concat((piece.notes || []).map(function (note) { return note.key + note.value; })).concat(piece.sources || [], piece.principles || []).filter(Boolean).join('');
       }).join('') || '질문 잡지';
       glyphs = Array.from(new Set(Array.from(glyphs))).join('');
@@ -592,9 +827,12 @@
     state.cover = explicit || parseCover('');
     if (!explicit && articles.length) { state.cover.question = articles[0].title; state.cover.hero = articles[0].hero; }
     state.hasCover = !!explicit || articles.length > 1;
+    // Frames have fixed dimensions, so image conversion proceeds independently
+    // of pagination and updates the current views when each picture is ready.
+    prepareImages(false);
     if (!articles.length) stage.appendChild(element('p', 'qm-empty', '기사 파일을 더하거나 이 화면에 끌어다 놓아 주세요.'));
     else {
-      if (state.hasCover) renderCover(state.cover);
+      if (state.hasCover) renderCover(state.cover, articles);
       if (state.pieces.length > 1) renderContents(articles);
       var opening = articles.filter(function (a) { return a.section === '여는 글'; });
       opening.forEach(function (article) { try { renderArticle(article, false); } catch (error) { state.failures.push(article.title + ': 기사를 그리지 못했습니다. ' + error.message); } });
@@ -622,12 +860,13 @@
     var result = { pages: state.pages.length, pieces: [], overflow: [], emptyFigures: 0, brokenImages: [], errors: state.failures.slice(), warnings: [] };
     state.pieces.forEach(function (piece) {
       var numbers = state.pages.filter(function (page) { return piece.kind === 'cover' ? page.kind === 'cover' : page.piece === piece; }).map(function (page) { return Number(page.paper.dataset.page); });
-      result.pieces.push({ kind: piece.kind, title: piece.title || piece.name || '', section: piece.section || '', pages: numbers, chars: piece.kind === 'article' ? articleChars(piece) : 0 });
+      result.pieces.push({ kind: piece.kind, title: piece.title || piece.name || '', section: piece.section || '', pages: numbers, chars: piece.kind === 'article' ? articleChars(piece) : 0, easyPanels: easyPanelCount(piece) });
       if (piece.kind === 'article') {
         if (!piece.title) result.errors.push('제목 없는 기사가 있습니다.');
         if (!numbers.length && state.mounted) result.errors.push((piece.title || '제목 없는 기사') + ': 그리지 못한 기사입니다.');
         if (numbers.length > 3) result.warnings.push(piece.title + ': 기사가 3쪽을 넘습니다.');
         if (!piece.sources.length) result.warnings.push((piece.title || '제목 없는 기사') + ': 출처가 없습니다.');
+        easyGroups(piece).forEach(function (group) { if (group.panels.length < 2 || group.panels.length > 4) result.warnings.push((piece.title || '제목 없는 기사') + ': 쉽게 보기 그림은 2~4컷으로 넣어 주세요. 현재 ' + group.panels.length + '컷입니다.'); });
       }
     });
     if (stage) {
@@ -639,7 +878,9 @@
         if (overflows(page.paper)) reasons.push('쪽 상자 넘침');
         // Client rects catch positioned text and column fragments that scroll
         // metrics alone can miss. Both bounds are measured in the same scale.
-        var bounds = page.paper.getBoundingClientRect(), walker = document.createTreeWalker(page.inner, 4), textNode;
+        if (page.easy && overflows(page.easy)) reasons.push('쉽게 보기 띠 넘침');
+        if (page.easy && Array.from(page.easy.querySelectorAll('.qm-easy-strip')).some(overflows)) reasons.push('쉽게 보기 컷 넘침');
+        var bounds = page.paper.getBoundingClientRect(), walker = document.createTreeWalker(page.paper, 4), textNode;
         while ((textNode = walker.nextNode())) {
           if (!textNode.textContent.trim() || !textNode.parentElement.getClientRects().length) continue;
           var range = document.createRange(); range.selectNodeContents(textNode);
@@ -649,20 +890,21 @@
       });
       result.emptyFigures = stage.querySelectorAll('.qm-figure[data-empty="true"]').length;
       Array.from(stage.querySelectorAll('.qm-figure img')).forEach(function (img) {
-        if (img.complete && !img.naturalWidth) result.brokenImages.push({ src: img.getAttribute('src'), page: Number(img.closest('.qm-sheet').dataset.page) });
+        if (img.getAttribute('src') && img.complete && !img.naturalWidth) result.brokenImages.push({ src: img.getAttribute('src'), page: Number(img.closest('.qm-sheet').dataset.page) });
       });
     }
     result.overflow.forEach(function (item) { result.errors.push(item.page + '쪽: ' + item.reasons.join(', ')); });
     if (result.emptyFigures) result.warnings.push('빈 그림 자리가 ' + result.emptyFigures + '개 있습니다.');
     if (result.brokenImages.length) result.warnings.push('불러오지 못한 그림이 ' + result.brokenImages.length + '개 있습니다.');
     if (state.hasCover && result.pages % 4) result.warnings.push('전체 쪽수가 4의 배수가 아닙니다.');
+    if (hasUnsavedImages()) result.warnings.push('그림 주소는 7일 뒤 사라져요. 「잡지 파일로 저장」으로 그림을 파일 안에 넣어 두세요.');
     return result;
   }
   function refreshStatus() {
     if (!status || !state.mounted || stage.classList.contains('qm-measuring')) return;
     var report = audit(), articles = state.pieces.filter(function (piece) { return piece.kind === 'article'; }).length;
     status.dataset.error = String(report.errors.length > 0);
-    status.textContent = report.pages + '쪽 / 기사 ' + articles + '개 / 빈 그림 자리 ' + report.emptyFigures + '개' + (report.overflow.length ? ' / 넘침 ' + report.overflow.length + '쪽' : '') + (report.errors.length ? ' / 오류 ' + report.errors.length + '개' : '') + (report.brokenImages.length ? ' / 못 읽은 그림 ' + report.brokenImages.length + '개' : '');
+    status.textContent = report.pages + '쪽 / 기사 ' + articles + '개 / 빈 그림 자리 ' + report.emptyFigures + '개' + (report.overflow.length ? ' / 넘침 ' + report.overflow.length + '쪽' : '') + (report.errors.length ? ' / 오류 ' + report.errors.length + '개' : '') + (report.brokenImages.length ? ' / 못 읽은 그림 ' + report.brokenImages.length + '개' : '') + (hasUnsavedImages() ? ' — 그림 주소는 7일 뒤 사라져요. 「잡지 파일로 저장」으로 그림을 파일 안에 넣어 두세요.' : '');
     status.title = report.errors.concat(report.warnings).join('\n');
   }
   function announce(text) { if (message) message.textContent = text; }
@@ -681,15 +923,11 @@
       // document could load its img/iframe resources even in an inert document.
       var scripts = /<!--[\s\S]*?-->|<script\b((?:"[^"]*"|'[^']*'|[^'">])*)>([\s\S]*?)<\/script\s*>/gi;
       var pieces = [], match;
-      function attribute(attrs, name) {
-        var pattern = new RegExp('(?:^|\\s)' + name + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\'|([^\\s"\'=<>`]+))', 'i');
-        var value = attrs.match(pattern); return value ? value[1] || value[2] || value[3] || '' : '';
-      }
       while ((match = scripts.exec(text))) {
         if (!match[1]) continue;
-        var type = attribute(match[1], 'type').toLowerCase();
+        var type = htmlAttribute(match[1], 'type').toLowerCase();
         if (type !== 'text/x-article' && type !== 'text/x-cover') continue;
-        var raw = attribute(match[1], 'data-qm-encoding') === 'uri' ? decodeURIComponent(match[2].trim()) : match[2];
+        var raw = htmlAttribute(match[1], 'data-qm-encoding') === 'uri' ? decodeURIComponent(match[2].trim()) : match[2];
         pieces.push(type === 'text/x-cover' ? parseCover(raw) : parseArticle(raw));
       }
       if (pieces.length) return pieces;
@@ -738,10 +976,9 @@
     });
   }
   function allFigures() {
-    var figures = [];
-    state.pieces.forEach(function (piece) { if (piece.hero) figures.push(piece.hero); (piece.blocks || []).forEach(function (block) { if (block.type === 'figure') figures.push(block); }); });
-    return figures;
+    return state.pieces.reduce(function (figures, piece) { return figures.concat(pieceFigures(piece).map(function (entry) { return entry.model; })); }, []);
   }
+  function hasUnsavedImages() { return allFigures().some(function (model) { return /^https:/i.test(model.src) || unsavedImages.has(model); }); }
   function serialize(piece) {
     function picture(model) { return '그림: ' + model.src + ' | ' + model.caption; }
     if (piece.kind === 'cover') {
@@ -757,6 +994,7 @@
     lines.push('');
     piece.blocks.forEach(function (block) {
       if (block.type === 'figure') lines.push(picture(block));
+      else if (block.type === 'easy') { lines.push('[쉽게 보기] ' + block.title); block.panels.forEach(function (panel) { lines.push(picture(panel)); }); lines.push(''); }
       else if (block.type === 'box') { lines.push('[상자] ' + block.title); block.lines.forEach(function (line) { lines.push((line.bullet ? '- ' : '') + '[문단] ' + line.text); }); lines.push(''); }
       // An unknown label is stripped LAST by cleanText. It shields canonical
       // prose from being mistaken for a header, number, role, or block marker
@@ -770,20 +1008,8 @@
   async function saveMagazine(event) {
     var control = event.currentTarget; control.disabled = true; announce('그림을 담아 잡지 파일을 만들고 있습니다.');
     try {
-      var requests = new Map();
-      await Promise.all(allFigures().map(async function (model) {
-        if (!/^https:/i.test(model.src)) return;
-        if (!requests.has(model.src)) requests.set(model.src, (async function () {
-          var controller = new AbortController(), timer = setTimeout(function () { controller.abort(); }, 8000);
-          try {
-            var response = await fetch(model.src, { credentials: 'omit', referrerPolicy: 'no-referrer', signal: controller.signal });
-            if (!response.ok || !safeImageURL(response.url)) return null;
-            var blob = await response.blob(); if (!/^image\//i.test(blob.type)) return null;
-            return safeImageURL(await readImage(blob));
-          } catch (error) { return null; } finally { clearTimeout(timer); }
-        }()));
-        var embedded = await requests.get(model.src); if (embedded) model.src = embedded;
-      }));
+      await state.queue;
+      prepareImages(true); await waitForImages();
       var html = element('html'); html.lang = 'ko'; var head = element('head'), body = element('body');
       var meta = element('meta'); meta.setAttribute('charset', 'utf-8'); head.appendChild(meta);
       var viewport = element('meta'); viewport.name = 'viewport'; viewport.content = 'width=device-width, initial-scale=1'; head.appendChild(viewport);
@@ -801,6 +1027,7 @@
       html.appendChild(head); html.appendChild(body);
       var blobURL = URL.createObjectURL(new Blob(['<!doctype html>\n' + html.outerHTML], { type: 'text/html;charset=utf-8' }));
       var link = element('a'); link.href = blobURL; link.download = name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '').slice(0, 100) + '.html'; document.body.appendChild(link); link.click(); link.remove(); setTimeout(function () { URL.revokeObjectURL(blobURL); }, 1000);
+      allFigures().forEach(function (model) { if (/^data:image\//i.test(model.src)) unsavedImages.delete(model); }); refreshStatus();
       announce('잡지 파일을 저장했습니다.' + (allFigures().some(function (figure) { return /^https:/i.test(figure.src); }) ? ' 담지 못한 그림은 원래 주소로 남겼습니다.' : ''));
     } catch (error) { announce('파일을 저장하지 못했습니다. 다시 눌러 주세요.'); }
     finally { control.disabled = false; }

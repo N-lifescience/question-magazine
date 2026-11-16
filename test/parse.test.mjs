@@ -4,12 +4,13 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
 const require = createRequire(import.meta.url);
-const { parseArticle, parseCover, ready } = require('../magazine.js');
+const { parseArticle, parseCover, ready, imagesReady } = require('../magazine.js');
 // Expose only the pure serializer in an isolated Node evaluation. The shipped
 // public API stays unchanged; this exercises the real save/reload grammar.
 const source = readFileSync(new URL('../magazine.js', import.meta.url), 'utf8');
 const sandbox = { module: { exports: {} }, URL };
-runInNewContext(source.replace('  return api;\n}));', '  api.serialize = serialize;\n  api.readPieces = readPieces;\n  return api;\n}));'), sandbox);
+const helpers = ['serialize', 'readPieces', 'droppedImageURL', 'pieceFigures', 'hasArticleImages', 'coverQuestions', 'state', 'prepareImages', 'shrinkImage', 'replaceFigure', 'unsavedImages', 'hasUnsavedImages'];
+runInNewContext(source.replace('  return api;\n}));', helpers.map(name => '  api.' + name + ' = ' + name + ';').join('\n') + '\n  return api;\n}));'), sandbox);
 const serialize = sandbox.module.exports.serialize;
 const readPieces = sandbox.module.exports.readPieces;
 let passed = 0;
@@ -25,6 +26,7 @@ test('DOM 없이 CommonJS로 불러오며 ready도 풀린다', () => {
   assert.equal(typeof ready.then, 'function');
 });
 await ready;
+await imagesReady;
 
 test('머리 칸의 모든 같은 뜻 키와 전각 쌍점', () => {
   for (const key of ['꼭지', '분야', '영역', '갈래']) assert.equal(parseArticle(`${key}： 자연과학`).section, '자연과학');
@@ -193,6 +195,202 @@ test('기사 글의 script 예시는 HTML 파일로 오인하지 않는다', () 
   assert.equal(readPieces('**잡지:** 표지\n호: 창간호', false)[0].kind, 'cover');
 });
 
+const majounURL = 'https://elicebackendstorage.blob.core.windows.net/helpy-agent/agents/tool-outputs/image/b08fe3f4c2c64b71bcd9c586c72c7501.jpg?se=2026-11-23T04%3A12%3A59Z&sp=r&sv=2026-02-06&sr=b&sig=eTUGu5yEwH17xfafFIVQNmqu0hKj8UI4VCyWDaobo2M%3D';
+test('실제 마주온 주소를 두 Markdown 그림 꼴에서 온전히 꺼낸다', () => {
+  for (const [line, caption] of [['![설명](' + majounURL + ')', '설명'], ['그림: ![generated image](' + majounURL + ') | 쉬운 설명', '쉬운 설명']]) {
+    assert.deepEqual(parseArticle('제목: 그림\n' + line).hero, { src: majounURL, caption });
+    assert.equal(body('본문\n' + line).blocks[1].src, majounURL);
+    assert.equal(parseCover(line).hero.src, majounURL);
+  }
+});
+
+test('Markdown 주소의 괄호와 설명 뒤의 괄호, 세로줄을 구별한다', () => {
+  const url = 'https://example.org/image_(one).jpg?x=(2)&y=3';
+  assert.deepEqual(parseArticle('그림: ![원래 설명](' + url + ') | 바꾼 설명 (모형) | 뒤').hero, { src: url, caption: '바꾼 설명 (모형) | 뒤' });
+  assert.equal(parseArticle('![도형](data:image/svg+xml,%3Csvg/%3E)').hero.src, 'data:image/svg+xml,%3Csvg/%3E');
+});
+
+test('Markdown 안의 위험한 주소도 빈 자리로 거른다', () => {
+  for (const url of ['http://example.org/a.jpg', 'javascript:alert(1)', 'file:///a.png', 'data:text/html,test', '//example.org/a.jpg']) {
+    assert.deepEqual(parseArticle('![설명](' + url + ')').hero, { src: '', caption: '설명' });
+    assert.equal(parseCover('그림: ![설명](' + url + ') | 표지').hero.src, '');
+  }
+});
+
+test('쉽게 보기의 2~4컷, 빈 그림과 세 가지 그림 줄을 받는다', () => {
+  const a = body('[쉽게 보기] 동생에게 설명하면\n그림: ' + majounURL + ' | 첫째\n![둘째](data:image/svg+xml,%3Csvg/%3E)\n그림: | 셋째\n사진: 넷째\n\n다음 문단');
+  assert.equal(a.hero, null);
+  assert.deepEqual(a.blocks.map(b => b.type), ['easy', 'paragraph']);
+  assert.equal(a.blocks[0].title, '동생에게 설명하면');
+  assert.deepEqual(a.blocks[0].panels, [{ src: majounURL, caption: '첫째' }, { src: 'data:image/svg+xml,%3Csvg/%3E', caption: '둘째' }, { src: '', caption: '셋째' }, { src: '', caption: '넷째' }]);
+});
+
+test('쉽게 보기는 빈 줄이나 다음 덩어리에서 끝난다', () => {
+  for (const next of ['## 소제목', '> 따옴글', '[상자] 상자\n안내', '[취재 노트]\nAI 사용: 확인', '출처:\n1. 자료', '[쉽게 보기] 다음\n그림: 셋\n그림: 넷', '일반 문단']) {
+    const a = body('[쉽게 보기] 처음\n그림: 하나\n그림: 둘\n' + next);
+    assert.equal(a.blocks[0].panels.length, 2, next);
+  }
+  const a = body('[쉽게 보기] 처음\n그림: 하나\n그림: 둘\n\n그림: 본문 그림');
+  assert.equal(a.blocks[1].type, 'figure');
+});
+
+test('상자나 출처 다음의 쉽게 보기 표제를 본문으로 삼지 않는다', () => {
+  for (const prefix of ['[상자] 안내\n문장', '출처:\n1. 자료']) {
+    const a = body(prefix + '\n[쉽게 보기] 쉽게\n그림: 하나\n그림: 둘');
+    assert.equal(a.blocks.at(-1).type, 'easy');
+    assert.equal(a.blocks.at(-1).panels.length, 2);
+  }
+});
+
+test('쉽게 보기의 빈 그림, Markdown과 사용자 문구를 저장해 다시 읽는다', () => {
+  const a = body('[쉽게 보기] <제목>\n![<img src=x onerror=alert(1)>](' + majounURL + ')\n그림: | https://example.org/is-a-caption\n\n[문단] [쉽게 보기]는 본문 글이다.');
+  assert.deepEqual(parseArticle(serialize(a)), a);
+  assert.deepEqual(parseArticle(serialize(parseArticle(serialize(a)))), a);
+});
+
+test('기자 줄의 그림 표시는 실제 대표, 본문, 쉽게 보기 그림에만 붙는다', () => {
+  const has = sandbox.module.exports.hasArticleImages;
+  for (const text of ['그림: 빈 대표', '본문\n그림: 빈 그림', '[쉽게 보기] 쉽게\n그림: 하나\n그림: 둘', '문단']) assert.equal(has(body(text)), false);
+  for (const text of ['그림: ' + majounURL, '본문\n그림: ' + majounURL, '[쉽게 보기] 쉽게\n그림: ' + majounURL + '\n그림: 둘']) assert.equal(has(body(text)), true);
+});
+
+test('audit은 쉽게 보기 컷 수를 싣고 범위를 벗어난 컷 수를 알린다', () => {
+  const internal = sandbox.module.exports;
+  for (const count of [0, 1, 2, 3, 4, 5, 6]) {
+    internal.state.pieces = [body('[쉽게 보기] 쉽게\n' + Array.from({ length: count }, (_, i) => '그림: 컷 ' + i).join('\n'))];
+    const report = internal.audit();
+    assert.equal(report.pieces[0].easyPanels, count);
+    assert.equal(report.warnings.some(w => w.includes('쉽게 보기')), count < 2 || count > 4);
+  }
+  internal.state.pieces = [];
+});
+
+const transfer = (uri = '', html = '') => ({ getData: type => type === 'text/uri-list' ? uri : type === 'text/html' ? html : '' });
+test('다른 탭에서 끌어온 uri-list의 댓글과 위험한 주소를 건너뛴다', () => {
+  const read = sandbox.module.exports.droppedImageURL;
+  assert.equal(read(transfer('# 댓글\r\nhttp://example.org/a.jpg\r\n' + majounURL)), majounURL);
+  assert.equal(read(transfer('javascript:alert(1)\nfile:///a.png')), '');
+});
+
+test('끌어온 HTML에서 img src만 꺼내고 주소의 HTML entity를 푼다', () => {
+  const read = sandbox.module.exports.droppedImageURL;
+  assert.equal(read(transfer('', '<img alt="그림 > 설명" src="https://example.org/a.jpg?x=1&amp;y=2&#x26;z=3">')), 'https://example.org/a.jpg?x=1&y=2&z=3');
+  assert.equal(read(transfer('', '<!-- <img src="https://example.org/hidden"> --><script><img src="https://example.org/script"></script><img data-src="https://example.org/data" src=javascript:alert(1)><img src=\'' + majounURL + '\'>')), majounURL);
+  assert.equal(read(transfer('', '<img alt=" src=\'https://example.org/false\' " src="http://example.org/unsafe">')), '');
+});
+
+test('표지 질문은 대표 기사를 먼저 두고 기사 제목을 최대 다섯 개 고른다', () => {
+  const articles = Array.from({ length: 8 }, (_, i) => body('제목: 물음 ' + i));
+  const selected = sandbox.module.exports.coverQuestions({ question: '물음 6' }, articles);
+  assert.equal(selected.length, 5); assert.equal(selected[0].title, '물음 6');
+  assert.equal(new Set(selected).size, 5); assert.equal(articles[0].title, '물음 0');
+});
+
+// Exercise the asynchronous image pipeline with in-memory image/canvas/fetch
+// doubles. These verify sizes, caching, saving and races, not browser layout.
+async function asyncTest(name, fn) { await fn(); passed += 1; console.log('통과:', name); }
+const internal = sandbox.module.exports, canvases = [];
+let imageWidth = 2400, imageHeight = 1200;
+sandbox.setTimeout = setTimeout; sandbox.clearTimeout = clearTimeout; sandbox.AbortController = AbortController;
+sandbox.Image = class {
+  set src(value) { this.address = value; this.naturalWidth = imageWidth; this.naturalHeight = imageHeight; queueMicrotask(() => this.onload?.()); }
+};
+sandbox.FileReader = class {
+  readAsDataURL(blob) { this.result = blob.dataURL; queueMicrotask(() => this.onload()); }
+};
+sandbox.document = { createElement: tag => {
+  assert.equal(tag, 'canvas');
+  const canvas = { getContext: () => ({ fillRect: (...rect) => { canvas.fill = rect; }, drawImage: image => { canvas.address = image.address; } }), toDataURL: (type, quality) => {
+    canvas.type = type; canvas.quality = quality;
+    return 'data:image/jpeg;base64,' + Buffer.from(canvas.width + 'x' + canvas.height + canvas.address).toString('base64');
+  } };
+  canvases.push(canvas); return canvas;
+} };
+const imageResponse = url => ({ ok: true, url, blob: async () => ({ type: 'image/jpeg', dataURL: 'data:image/jpeg;base64,' + Buffer.from(url).toString('base64') }) });
+
+await asyncTest('쪽 나누기 ready는 그림을 기다리지 않고 imagesReady가 따로 기다린다', async () => {
+  let release, finished = false;
+  sandbox.fetch = url => new Promise(resolve => { release = () => resolve(imageResponse(url)); });
+  const article = body('그림: https://example.org/slow.jpg'); internal.state.pieces = [article];
+  internal.prepareImages(false);
+  const waiting = internal.imagesReady.then(() => { finished = true; });
+  await internal.ready; await Promise.resolve();
+  assert.equal(finished, false); assert.match(article.hero.src, /^https:/);
+  release(); await waiting;
+  assert.match(article.hero.src, /^data:image\/jpeg;/); assert.equal(finished, true);
+});
+
+await asyncTest('표지와 대표는 1600px, 본문과 쉽게 보기는 900px JPEG 0.85로 담는다', async () => {
+  const url = 'https://example.org/shared.jpg'; let requests = 0; canvases.length = 0;
+  sandbox.fetch = async address => { requests += 1; return imageResponse(address); };
+  const cover = parseCover('그림: ' + url), article = body('그림: ' + url + '\n본문\n그림: ' + url + '\n[쉽게 보기] 쉽게\n그림: ' + url + '\n그림: | 빈 컷');
+  internal.state.pieces = [cover, article]; internal.prepareImages(false); await internal.imagesReady;
+  assert.equal(requests, 2, '같은 주소와 크기의 변환은 한 번만 한다');
+  assert.deepEqual(canvases.map(c => [c.width, c.height]).sort(), [[1600, 800], [900, 450]]);
+  for (const canvas of canvases) { assert.equal(canvas.type, 'image/jpeg'); assert.equal(canvas.quality, .85); assert.deepEqual(canvas.fill, [0, 0, canvas.width, canvas.height]); }
+  assert.match(article.hero.src, /^data:image\/jpeg;/); assert.equal(article.blocks[1].src, article.blocks[2].panels[0].src);
+  assert.equal(article.hero.src, cover.hero.src);
+  assert.equal(internal.hasUnsavedImages(), true, '메모리에 담아도 저장 전 경고는 남긴다');
+  for (const piece of internal.state.pieces) assert.equal(serialize(piece).includes(url), false);
+  const saved = internal.state.pieces.map(piece => piece.kind === 'cover' ? parseCover(serialize(piece)) : parseArticle(serialize(piece)));
+  internal.state.pieces = saved;
+  assert.equal(internal.hasUnsavedImages(), false, 'data URL을 담은 저장본을 열면 경고가 없다');
+});
+
+await asyncTest('작은 그림은 키우지 않고 세로 그림의 긴 변으로 줄인다', async () => {
+  imageWidth = 400; imageHeight = 600; canvases.length = 0;
+  await internal.shrinkImage('data:image/png;base64,YQ==', 900);
+  assert.deepEqual([canvases[0].width, canvases[0].height], [400, 600]);
+  imageWidth = 1200; imageHeight = 2400;
+  await internal.shrinkImage('data:image/png;base64,Yg==', 900);
+  assert.deepEqual([canvases[1].width, canvases[1].height], [450, 900]);
+  imageWidth = 2400; imageHeight = 1200;
+});
+
+await asyncTest('fetch 실패는 원래 주소를 남기고 저장할 때 다시 받는다', async () => {
+  let requests = 0;
+  const article = body('그림: https://example.org/retry.jpg'); internal.state.pieces = [article];
+  sandbox.fetch = async () => { requests += 1; throw new Error('CORS'); };
+  internal.prepareImages(false); await internal.imagesReady;
+  assert.equal(article.hero.src, 'https://example.org/retry.jpg'); assert.equal(internal.hasUnsavedImages(), true);
+  internal.prepareImages(false); await internal.imagesReady; assert.equal(requests, 1);
+  sandbox.fetch = async url => { requests += 1; return imageResponse(url); };
+  internal.prepareImages(true); await internal.imagesReady;
+  assert.equal(requests, 2); assert.match(article.hero.src, /^data:image\/jpeg;/);
+});
+
+await asyncTest('그림이 아닌 응답과 허용하지 않은 최종 주소는 담지 않는다', async () => {
+  for (const [suffix, response] of [['mime', { ok: true, url: 'https://example.org/text', blob: async () => ({ type: 'text/html' }) }], ['redirect', { ok: true, url: 'http://example.org/insecure' }]]) {
+    const article = body('그림: https://example.org/' + suffix); internal.state.pieces = [article];
+    sandbox.fetch = async () => response; internal.prepareImages(false); await internal.imagesReady;
+    assert.match(article.hero.src, /^https:/);
+  }
+});
+
+await asyncTest('느린 처음 그림이 나중에 끌어놓은 그림을 덮어쓰지 않는다', async () => {
+  let release;
+  sandbox.fetch = url => url.endsWith('old.jpg') ? new Promise(resolve => { release = () => resolve(imageResponse(url)); }) : Promise.resolve(imageResponse(url));
+  const article = body('그림: https://example.org/old.jpg'); internal.state.pieces = [article];
+  internal.prepareImages(false);
+  await internal.replaceFigure(article.hero, 'https://example.org/new.jpg', 1600);
+  const latest = article.hero.src; release(); await internal.imagesReady;
+  assert.match(latest, /^data:image\/jpeg;/); assert.equal(article.hero.src, latest);
+});
+
+await asyncTest('그림 파일을 끌어놓아도 같은 크기로 줄이고 실패하면 기존 그림을 지킨다', async () => {
+  const article = body('본문\n그림: 빈 자리'); internal.state.pieces = [article]; canvases.length = 0;
+  const picture = article.blocks[1];
+  const file = { type: 'image/png', name: 'picture.png', size: 1, slice: () => ({ dataURL: 'data:image/png;base64,YQ==' }) };
+  await internal.replaceFigure(picture, file, 900);
+  assert.deepEqual([canvases[0].width, canvases[0].height], [900, 450]);
+  const previous = picture.src;
+  sandbox.fetch = async () => { throw new Error('CORS'); };
+  await internal.replaceFigure(picture, 'https://example.org/failed-drop.jpg', 900);
+  assert.equal(picture.src, previous);
+  assert.equal(internal.hasUnsavedImages(), false);
+});
+internal.state.pieces = [];
+
 // Example constraints are checked when the examples have been authored.
 for (const filename of ['article.html', 'magazine.html']) {
   const html = readFileSync(new URL('../examples/' + filename, import.meta.url), 'utf8');
@@ -215,6 +413,9 @@ for (const filename of ['article.html', 'magazine.html']) {
     } else {
       assert.equal((html.match(/type="text\/x-cover"/g) || []).length, 1);
       assert.deepEqual(articles.map(a => a.section).sort(), ['사회과학', '여는 글', '자연과학', '자연과학']);
+      const easy = articles.filter(a => a.section === '자연과학').flatMap(a => a.blocks.filter(b => b.type === 'easy'));
+      assert.equal(easy.length, 1); assert.equal(easy[0].panels.length, 3);
+      for (const panel of easy[0].panels) assert.match(panel.src, /^data:image\/svg\+xml,/);
     }
   });
 }
