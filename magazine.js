@@ -228,6 +228,14 @@
   function articleChars(article) {
     return article.blocks.map(function (block) { return block.text || (block.lines || []).map(function (line) { return line.text; }).join(''); }).join('').replace(/\[\d+\]/g, '').length;
   }
+  function articleQuestion(article) {
+    var paragraphs = article.blocks.filter(function (block) { return block.type === 'paragraph'; });
+    var last = paragraphs.length ? paragraphs[paragraphs.length - 1].text.trim() : '';
+    // A decimal point is not a sentence boundary. Include a closing quote when
+    // the first sentence is quoted, but never pick a later question instead.
+    var first = last.match(/^.*?(?:[!?！？。]|\.(?=["'”’」』]?(?:\s|$))|$)["'”’」』]?/);
+    return first && /[?？]["'”’」』]?$/.test(first[0]) ? first[0] : article.title || '제목 없는 기사';
+  }
   function easyGroups(article) { return (article.blocks || []).filter(function (block) { return block.type === 'easy'; }); }
   function easyPanelCount(article) { return easyGroups(article).reduce(function (count, group) { return count + group.panels.length; }, 0); }
   function pieceFigures(piece) {
@@ -330,6 +338,11 @@
     .qm-compact .qm-columns .qm-figure .qm-image-frame { aspect-ratio:16/10; }
     .qm-compact .qm-source { font-size:6.2pt; }
     .qm-compact .qm-quote { font-size:12pt; }
+    .qm-article-question { position:absolute; left:0; right:0; display:flex; flex-direction:column; justify-content:center; gap:4mm; padding:6mm; background:var(--qm-tint); text-align:center; font-family:'Pretendard Variable',sans-serif; }
+    .qm-article-question p { margin:0; }
+    .qm-article-question-label { color:var(--qm-color); font-size:8pt; line-height:1.4; }
+    .qm-article-question h3 { margin:0; font-size:18pt; font-weight:700; line-height:1.4; }
+    .qm-article-question-prompt { font-size:9pt; line-height:1.5; text-wrap:pretty; }
     .qm-cover { --qm-color:#1f5f8b; padding-top:calc(5mm + var(--qm-bleed)); }
     .qm-cover .qm-inner { display:flex; flex-direction:column; z-index:2; pointer-events:none; }
     .qm-cover-masthead { flex:none; min-height:55mm; padding-block:5mm; }
@@ -356,11 +369,11 @@
     .qm-toc-row strong { display:block; font:700 12pt/1.45 'Pretendard Variable',sans-serif; }
     .qm-toc-row small { display:block; font-size:8pt; margin-top:1mm; }
     .qm-toc-number { text-align:right; align-self:center; font:10pt/1.5 'Pretendard Variable',sans-serif; font-variant-numeric:tabular-nums; }
-    .qm-note-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:5mm; }
-    .qm-note-card { background:var(--qm-tint); padding:5mm; }
-    .qm-note-card h3 { margin:0 0 2mm; font-size:13pt; color:var(--qm-color); }
-    .qm-note-card p { margin:2mm 0; font-size:10pt; }
-    .qm-note-card small { font:8pt/1.5 'Pretendard Variable',sans-serif; }
+    .qm-note-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:3mm; align-content:start; }
+    .qm-note-card { min-width:0; background:var(--qm-tint); padding:3mm; }
+    .qm-note-card h3 { margin:0 0 1mm; font-size:11pt; line-height:1.3; color:var(--qm-color); }
+    .qm-note-card p { margin:1.5mm 0 0; font-size:9pt; line-height:1.55; }
+    .qm-note-card small { display:block; font:8pt/1.4 'Pretendard Variable',sans-serif; }
     .qm-writing-lines { height:175mm; margin-top:10mm; background:repeating-linear-gradient(to bottom,transparent 0,transparent calc(12mm - 1px),#bfc8b9 calc(12mm - 1px),#bfc8b9 12mm); }
     .qm-back h3 { font-size:13pt; margin:8mm 0 3mm; color:var(--qm-color); }
     .qm-back p,.qm-back li { font-size:10pt; line-height:1.85; }
@@ -769,11 +782,37 @@
       state.failures.splice(failureStart);
       regular.forEach(function (page) { stage.appendChild(page.shell); state.pages.push(page); });
       Array.prototype.push.apply(state.failures, failures);
+      addArticleQuestion(regular[regular.length - 1], article);
     }
     figureViews.forEach(function (views, model) {
       views.forEach(function (view) { if (!view.figure.isConnected) views.delete(view); });
       if (!views.size) figureViews.delete(model);
     });
+  }
+  function addArticleQuestion(page, article) {
+    if (page.questionCard || page.bodyHeight < 0 || overflows(page.columns) || overflows(page.inner)) return;
+    var bounds = page.columns.getBoundingClientRect(), inner = page.inner.getBoundingClientRect();
+    var scale = bounds.width / page.columns.clientWidth, mm = 96 / 25.4;
+    if (!(scale > 0)) return;
+    var bottom = Array.from(page.columns.children).reduce(function (used, node) {
+      var margin = (parseFloat(getComputedStyle(node).marginBottom) || 0) * scale;
+      return Array.from(node.getClientRects()).reduce(function (end, rect) {
+        return rect.width && rect.height ? Math.max(end, rect.bottom + margin) : end;
+      }, used);
+    }, bounds.top);
+    var top = (bottom - inner.top) / scale + 4 * mm;
+    var height = (bounds.bottom - inner.top) / scale - top;
+    if (height < 60 * mm) return;
+    // Keep the measured columns unchanged: shortening them would reflow text
+    // into the reserved space. The full-width band is their positioned sibling.
+    var card = element('aside', 'qm-article-question');
+    card.style.top = top + 'px'; card.style.height = height + 'px';
+    card.appendChild(element('p', 'qm-article-question-label', '기자가 남긴 질문'));
+    card.appendChild(element('h3', '', articleQuestion(article)));
+    card.appendChild(element('p', 'qm-article-question-prompt', '여러분의 생각은? 독자 질문함에 적어 주세요.'));
+    page.inner.appendChild(card);
+    if (overflows(card) || overflows(page.inner)) { card.remove(); return; }
+    page.questionCard = card;
   }
 
   function orderedArticles() {
@@ -840,6 +879,7 @@
     var withNotes = articles.filter(function (article) { return article.authorNote; }); if (withNotes.length < 2) return;
     var page = flowPage('author-notes', '기자의 말', true);
     withNotes.forEach(function (article) {
+      if (page.flow.children.length === 8) page = flowPage('author-notes', '기자의 말, 이어서', true);
       var card = element('article', 'qm-note-card'); applyColor(card, sectionColor(article.section));
       card.appendChild(element('h3', '', article.author || '익명')); card.appendChild(element('small', '', article.title)); card.appendChild(element('p', '', article.authorNote));
       page.flow.appendChild(card);
@@ -888,7 +928,7 @@
     // whose face has not yet been used by a previous render.
     await state.fontStyles;
     if (document.fonts) {
-      var glyphs = '질문 잡지 이번 호 질문 쉽게 보기 ①②③④ 차례 이어서 계속 기자의 말 출처 취재 노트 독자 질문함 메모 질문을 모은 사람들 사람과 사회의 물음표 몸과 자연의 물음표 그 밖의 질문 AI 사용 원칙 이 잡지는 마주온 에이전트 질문을 학교 잡지로 함께 만들었습니다. 글 그림 AI 생성 익명 제목 없는 기사 다음 호에서 함께 살펴볼 질문을 적어 주세요. 일상에서 궁금했던 일도 좋습니다. 그림 파일이나 다른 탭의 그림을 여기에 끌어다 놓으세요. 눌러서 골라도 됩니다. 그림을 불러오고 있습니다. 컷 PART 1 PART 2' + DEFAULT_RULES.join('') + state.pieces.map(function (piece) {
+      var glyphs = '질문 잡지 이번 호 질문 쉽게 보기 ①②③④ 차례 이어서 계속 기자의 말 출처 취재 노트 독자 질문함 메모 질문을 모은 사람들 사람과 사회의 물음표 몸과 자연의 물음표 그 밖의 질문 AI 사용 원칙 이 잡지는 마주온 에이전트 질문을 학교 잡지로 함께 만들었습니다. 글 그림 AI 생성 익명 제목 없는 기사 기자가 남긴 질문 여러분의 생각은? 독자 질문함에 적어 주세요. 다음 호에서 함께 살펴볼 질문을 적어 주세요. 일상에서 궁금했던 일도 좋습니다. 그림 파일이나 다른 탭의 그림을 여기에 끌어다 놓으세요. 눌러서 골라도 됩니다. 그림을 불러오고 있습니다. 컷 PART 1 PART 2' + DEFAULT_RULES.join('') + state.pieces.map(function (piece) {
         return [piece.title, piece.name, piece.section, piece.subtitle, piece.author, piece.authorNote, piece.tagline, piece.question, piece.english, piece.issue, piece.school, piece.date, piece.hero && piece.hero.caption]
           .concat(Object.keys(piece.sectionNames || {}).map(function (section) { return section + piece.sectionNames[section]; }))
           .concat((piece.blocks || []).map(function (block) { return [block.text, block.caption, block.title].filter(Boolean).join('') + (block.lines || []).map(function (line) { return line.text; }).join('') + (block.panels || []).map(function (panel) { return panel.caption; }).join(''); }))
@@ -943,12 +983,12 @@
         if (!piece.title) result.errors.push('제목 없는 기사가 있습니다.');
         if (!numbers.length && state.mounted) result.errors.push((piece.title || '제목 없는 기사') + ': 그리지 못한 기사입니다.');
         if (numbers.length > 3) result.warnings.push(piece.title + ': 기사가 3쪽을 넘습니다.');
-        if (!piece.sources.length) result.warnings.push((piece.title || '제목 없는 기사') + ': 출처가 없습니다.');
+        if (!piece.sources.length && (piece.section === '사회과학' || piece.section === '자연과학')) result.warnings.push((piece.title || '제목 없는 기사') + ': 출처가 없습니다.');
         easyGroups(piece).forEach(function (group) { if (group.panels.length < 2 || group.panels.length > 4) result.warnings.push((piece.title || '제목 없는 기사') + ': 쉽게 보기 그림은 2~4컷으로 넣어 주세요. 현재 ' + group.panels.length + '컷입니다.'); });
       }
     });
     state.pages.forEach(function (page) {
-      if (['questions', 'memo', 'back'].indexOf(page.kind) < 0 && fillRatio(page, false) < .15) {
+      if (['questions', 'memo', 'back'].indexOf(page.kind) < 0 && !page.questionCard && fillRatio(page, false) < .15) {
         result.warnings.push(page.paper.dataset.page + '쪽: 거의 빈 쪽입니다.');
       }
     });

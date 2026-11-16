@@ -9,7 +9,7 @@ const { parseArticle, parseCover, ready, imagesReady } = require('../magazine.js
 // public API stays unchanged; this exercises the real save/reload grammar.
 const source = readFileSync(new URL('../magazine.js', import.meta.url), 'utf8');
 const sandbox = { module: { exports: {} }, URL };
-const helpers = ['serialize', 'readPieces', 'droppedImageURL', 'pieceFigures', 'hasArticleImages', 'coverQuestions', 'state', 'prepareImages', 'shrinkImage', 'replaceFigure', 'unsavedImages', 'hasUnsavedImages', 'inline', 'fillRatio', 'renderArticle', 'renderCover'];
+const helpers = ['serialize', 'readPieces', 'droppedImageURL', 'pieceFigures', 'hasArticleImages', 'coverQuestions', 'articleQuestion', 'addArticleQuestion', 'state', 'prepareImages', 'shrinkImage', 'replaceFigure', 'unsavedImages', 'hasUnsavedImages', 'inline', 'fillRatio', 'renderArticle', 'renderCover', 'renderAuthorNotes'];
 const expose = helpers.map(name => '  api.' + name + ' = ' + name + ';').join('\n') + '\n  api.setSurface = function (surface) { stage = surface; };';
 runInNewContext(source.replace('  return api;\n}));', expose + '\n  return api;\n}));'), sandbox);
 const serialize = sandbox.module.exports.serialize;
@@ -71,6 +71,27 @@ test('세 종류 소제목, 따옴글과 본문 그림', () => {
   const a = body('# 첫째\n문단\n## 둘째\n> 물음은 남는다.\n### 셋째\n사진: 틀만 있는 그림');
   assert.deepEqual(a.blocks.map(b => b.type), ['heading', 'paragraph', 'heading', 'quote', 'heading', 'figure']);
   assert.equal(a.blocks[5].caption, '틀만 있는 그림');
+});
+
+test('마지막 본문 문단의 첫 문장이 물음이면 그 문장만 고른다', () => {
+  const a = body('처음 문단이다.\n## 남은 물음\n어떤 조건에서 달라질까? 다음에는 직접 재 보고 싶다.\n> 따옴글은 마지막 본문이 아니다.\n[쉽게 보기] 쉽게\n그림: 하나\n그림: 둘\n[취재 노트]\nAI 사용: 확인했다.\n출처:\n1. 자료');
+  assert.equal(sandbox.module.exports.articleQuestion(a), '어떤 조건에서 달라질까?');
+  assert.equal(sandbox.module.exports.articleQuestion(parseArticle(serialize(a))), '어떤 조건에서 달라질까?');
+});
+
+test('마지막 문단 첫 문장이 물음이 아니면 뒤에 물음이 있어도 기사 제목을 고른다', () => {
+  const select = sandbox.module.exports.articleQuestion;
+  for (const text of ['알게 되었다. 그런데 왜 그럴까?', '아직 모르겠다! 왜일까?', '마침표 없는 맺음말', '']) {
+    assert.equal(select(body('앞 문단은 왜일까?\n' + (text || '## 본문 없는 끝'))), text ? '물음' : '앞 문단은 왜일까?');
+  }
+  assert.equal(select(body('## 제목만 있다\n> 물음인가?\n출처:\n1. 자료')), '물음');
+});
+
+test('첫 문장을 고를 때 소수점과 닫는 따옴표를 보존하고 앞 문단의 질문은 고르지 않는다', () => {
+  const select = sandbox.module.exports.articleQuestion;
+  assert.equal(select(body('1.5cm는 어디로 갔을까? 뒤 문장이다.')), '1.5cm는 어디로 갔을까?');
+  assert.equal(select(body('“왜 달라질까?” 다음 문장이다.')), '“왜 달라질까?”');
+  assert.equal(select(body('앞 문단은 왜일까?\n마지막 문단은 평서문이다.')), '물음');
 });
 
 test('머리 칸 첫 그림만 대표 그림이고 나머지는 본문 끝, 늦은 기자 줄은 머리 칸', () => {
@@ -272,7 +293,7 @@ test('기사 글의 script 예시는 HTML 파일로 오인하지 않는다', () 
   assert.equal(readPieces('**잡지:** 표지\n호: 창간호', false)[0].kind, 'cover');
 });
 
-const majounURL = 'https://elicebackendstorage.blob.core.windows.net/helpy-agent/agents/tool-outputs/image/b08fe3f4c2c64b71bcd9c586c72c7501.jpg?se=2026-11-23T04%3A12%3A59Z&sp=r&sv=2026-02-06&sr=b&sig=eTUGu5yEwH17xfafFIVQNmqu0hKj8UI4VCyWDaobo2M%3D';
+const majounURL = 'https://elicebackendstorage.blob.core.windows.net/helpy-agent/agents/tool-outputs/image/a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5.jpg?se=2026-01-01T00%3A00%3A00Z&sp=r&sv=2026-02-06&sr=b&sig=TESTSIGNATURE0000000000000000000000000000000%3D';
 test('실제 마주온 주소를 두 Markdown 그림 꼴에서 온전히 꺼낸다', () => {
   for (const [line, caption] of [['![설명](' + majounURL + ')', '설명'], ['그림: ![generated image](' + majounURL + ') | 쉬운 설명', '쉬운 설명']]) {
     assert.deepEqual(parseArticle('제목: 그림\n' + line).hero, { src: majounURL, caption });
@@ -382,6 +403,7 @@ class TextElement {
   set textContent(value) { this.children = [{ textContent: String(value) }]; }
   set innerHTML(value) { throw new Error('사용자 HTML 삽입 금지: ' + value); }
   appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
+  removeChild(child) { this.children.splice(this.children.indexOf(child), 1); child.parentElement = null; return child; }
   insertBefore(child, before) { child.parentElement = this; this.children.splice(this.children.indexOf(before), 0, child); return child; }
   remove() { if (this.parentElement) { const siblings = this.parentElement.children; siblings.splice(siblings.indexOf(this), 1); this.parentElement = null; } }
   setAttribute(name, value) { this[name] = value; }
@@ -399,6 +421,7 @@ class TextElement {
   querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
 }
 sandbox.document = { createElement: tag => new TextElement(tag), createTextNode: text => ({ textContent: text }) };
+sandbox.getComputedStyle = () => ({ marginBottom: '0px' });
 
 test('출처 주소는 접두어를 떼고 38자를 넘으면 36자와 …로 표시하며 전체 링크와 title을 남긴다', () => {
   const inline = sandbox.module.exports.inline;
@@ -443,6 +466,111 @@ const geometry = (rects, names = [], children = []) => ({
   children, classList: { contains: name => names.includes(name) }, getClientRects: () => rects, getBoundingClientRect: () => rects[0]
 });
 
+// Geometry doubles exercise the placement contract without rendering CSS.
+function questionPage(remainingMM, scale = 1) {
+  const mm = 96 / 25.4, height = 250 * mm, used = height - (remainingMM + 4) * mm;
+  const inner = new TextElement('div');
+  inner.getBoundingClientRect = () => rect(0, 0, 600 * scale, height * scale);
+  const columns = geometry([rect(0, 0, 600 * scale, height * scale)], ['qm-columns'], [geometry([rect(0, 0, 280 * scale, used * scale)])]);
+  Object.assign(columns, { clientWidth: 600, clientHeight: height, scrollWidth: 600, scrollHeight: height, style: { height: height + 'px' } });
+  inner.appendChild(columns);
+  return { inner, columns, bodyHeight: height };
+}
+
+test('질문 띠는 60mm부터 남은 높이를 쓰며 배율과 관계없이 2단 밖 아래에 놓인다', () => {
+  const api = sandbox.module.exports;
+  for (const scale of [1, .4]) {
+    const page = questionPage(80, scale), originalHeight = page.columns.style.height;
+    api.addArticleQuestion(page, body('마지막 물음은 무엇일까? 나머지 문장.'));
+    assert.equal(page.questionCard.parentElement, page.inner);
+    assert.equal(page.inner.children[0], page.columns);
+    assert.equal(page.columns.style.height, originalHeight, '기존 단 높이를 바꿔 재배치하지 않는다');
+    assert.ok(Math.abs(parseFloat(page.questionCard.style.height) - 80 * 96 / 25.4) < 1e-9);
+    assert.ok(Math.abs(parseFloat(page.questionCard.style.top) - 170 * 96 / 25.4) < 1e-9);
+    assert.equal(page.questionCard.querySelector('.qm-article-question-label').textContent, '기자가 남긴 질문');
+    assert.equal(page.questionCard.querySelector('h3').textContent, '마지막 물음은 무엇일까?');
+    assert.equal(page.questionCard.querySelector('.qm-article-question-prompt').textContent, '여러분의 생각은? 독자 질문함에 적어 주세요.');
+    api.addArticleQuestion(page, body('또 넣을까?'));
+    assert.equal(page.inner.children.length, 2, '중복 삽입을 막는다');
+  }
+  const exact = questionPage(60); api.addArticleQuestion(exact, body('물음?'));
+  assert.ok(exact.questionCard);
+  const small = questionPage(59.9); api.addArticleQuestion(small, body('물음?'));
+  assert.equal(small.questionCard, undefined);
+});
+
+test('질문 띠는 두 단의 가장 아래 조각과 여백을 피하고 넘친 본문에는 넣지 않는다', () => {
+  const api = sandbox.module.exports, page = questionPage(80);
+  page.columns.children[0].getClientRects = () => [rect(0, 0, 280, 100), rect(320, 0, 280, 700)];
+  sandbox.getComputedStyle = () => ({ marginBottom: '10px' });
+  try {
+    api.addArticleQuestion(page, body('물음?'));
+    assert.equal(page.questionCard, undefined, '둘째 단 아래에는 60mm가 남지 않는다');
+  } finally { sandbox.getComputedStyle = () => ({ marginBottom: '0px' }); }
+  const overflow = questionPage(80); overflow.columns.scrollWidth += 10;
+  api.addArticleQuestion(overflow, body('물음?'));
+  assert.equal(overflow.questionCard, undefined);
+});
+
+test('질문 띠의 질문과 제목은 HTML처럼 보여도 textContent로만 넣는다', () => {
+  const api = sandbox.module.exports;
+  for (const text of ['<img src=x onerror=alert(1)> 왜일까?', '마지막은 평서문이다.']) {
+    const page = questionPage(80), a = parseArticle('제목: <img src=x onerror=alert(2)>\n' + text);
+    api.addArticleQuestion(page, a);
+    assert.equal(page.questionCard.querySelector('h3').textContent, text.endsWith('?') ? text : a.title);
+    assert.equal(page.questionCard.querySelectorAll('img').length, 0);
+  }
+});
+
+test('질문 띠의 글이 남은 높이를 넘으면 카드를 거두고 본문을 보존한다', () => {
+  const create = sandbox.document.createElement;
+  sandbox.document.createElement = tag => {
+    const node = create(tag);
+    if (tag === 'aside') Object.assign(node, { clientHeight: 100, scrollHeight: 110 });
+    return node;
+  };
+  try {
+    const page = questionPage(80);
+    sandbox.module.exports.addArticleQuestion(page, body('물음?'));
+    assert.equal(page.questionCard, undefined);
+    assert.deepEqual(page.inner.children, [page.columns]);
+  } finally { sandbox.document.createElement = create; }
+});
+
+test('기자의 말은 한 쪽 최대 여덟 장이고 아홉째부터 다음 쪽으로 넘긴다', () => {
+  const api = sandbox.module.exports, surface = new TextElement('main');
+  const articles = Array.from({ length: 9 }, (_, i) => parseArticle(`제목: 물음 ${i}\n기자의 말: 달라진 생각 ${i}`));
+  api.state.cover = parseCover(''); api.setSurface(surface);
+  try {
+    for (const count of [7, 8, 9]) {
+      api.state.pages = []; surface.children = [];
+      api.renderAuthorNotes(articles.slice(0, count));
+      assert.deepEqual(Array.from(api.state.pages, page => page.flow.children.length), count <= 8 ? [count] : [8, 1]);
+      if (count === 9) assert.equal(api.state.pages[1].inner.querySelector('h2').textContent, '기자의 말, 이어서');
+    }
+  } finally { api.state.pages = []; api.setSurface(null); }
+});
+
+test('기자의 말이 길어 여덟 장 전에 넘쳐도 순서대로 다음 쪽에 보존한다', () => {
+  const api = sandbox.module.exports, surface = new TextElement('main'), create = sandbox.document.createElement;
+  // Model two cards per page to exercise the measured overflow fallback.
+  sandbox.document.createElement = tag => {
+    const node = create(tag);
+    Object.defineProperties(node, {
+      clientHeight: { get: () => 100 },
+      scrollHeight: { get() { return this.className === 'qm-note-grid' ? Math.ceil(this.children.length / 2) * 60 : 0; } }
+    });
+    return node;
+  };
+  api.state.cover = parseCover(''); api.state.pages = []; api.setSurface(surface);
+  try {
+    const articles = Array.from({ length: 5 }, (_, i) => parseArticle(`제목: 물음 ${i}\n기자의 말: 달라진 생각 ${i}`));
+    api.renderAuthorNotes(articles);
+    assert.deepEqual(Array.from(api.state.pages, page => page.flow.children.length), [2, 2, 1]);
+    assert.deepEqual(Array.from(api.state.pages).flatMap(page => page.flow.children.map(card => card.querySelector('p').textContent)), articles.map(a => a.authorNote));
+  } finally { sandbox.document.createElement = create; api.state.pages = []; api.setSurface(null); }
+});
+
 test('채움은 두 단의 실제 조각 넓이를 더하고 화면 배율이 바뀌어도 같다', () => {
   for (const scale of [1, .4]) {
     const r = (left, top, width, height) => rect(left * scale, top * scale, width * scale, height * scale);
@@ -473,13 +601,24 @@ test('audit은 채움 15% 미만을 거의 빈 쪽으로 알리고 독자 질문
   } finally { api.state.pages = []; }
 });
 
+test('audit은 질문 띠가 있는 기사 쪽만 거의 빈 쪽 경고에서 뺀다', () => {
+  const api = sandbox.module.exports;
+  api.state.pieces = [];
+  api.state.pages = [true, false].map((card, i) => ({
+    kind: 'article', questionCard: card ? {} : null, paper: { dataset: { page: String(i + 1) } },
+    inner: geometry([rect(0, 0, 100, 100)], [], [geometry([rect(0, 0, 100, 1)])])
+  }));
+  try { assert.deepEqual(Array.from(api.audit().warnings), ['2쪽: 거의 빈 쪽입니다.']); }
+  finally { api.state.pages = []; }
+});
+
 // Isolate the real retry/rollback controller from browser measurements. The
 // renderer is given synthetic pagination results; pixel layout remains manual.
 function paginationTrial(options = {}) {
   const context = { module: { exports: {} }, URL };
-  const setup = '\n  api.setPagination = function (paginate, fill, surface) { paginateArticle = paginate; fillRatio = fill; stage = surface; };';
+  const setup = '\n  api.setPagination = function (paginate, fill, surface, card) { paginateArticle = paginate; fillRatio = fill; stage = surface; addArticleQuestion = card; };';
   runInNewContext(source.replace('  return api;\n}));', expose + setup + '\n  return api;\n}));'), context);
-  const api = context.module.exports, surface = { children: [], appendChild(shell) { this.children.push(shell); } }, calls = [], original = [], trial = [];
+  const api = context.module.exports, surface = { children: [], appendChild(shell) { this.children.push(shell); } }, calls = [], cards = [], original = [], trial = [];
   const before = { shell: { remove() { throw new Error('다른 기사 쪽을 지웠다.'); } } };
   surface.appendChild(before.shell); api.state.pages = [before]; api.state.failures = ['이전 기사 오류'];
   api.setPagination((article, firstPart, compact) => {
@@ -496,12 +635,12 @@ function paginationTrial(options = {}) {
     if (!compact && options.originalFailure) api.state.failures.push('기존 오류');
   }, (page, bodyOnly) => {
     assert.equal(page, original.at(-1)); assert.equal(bodyOnly, true); return options.fill ?? .34;
-  }, surface);
+  }, surface, (page, article) => { cards.push({ page, article }); });
   const article = body('본문'); api.renderArticle(article, true);
   assert.equal(api.state.pages[0], before); assert.equal(surface.children[0], before.shell);
   assert.ok(calls.every(([piece, firstPart]) => piece === article && firstPart === true));
   assert.deepEqual(surface.children, Array.from(api.state.pages, page => page.shell));
-  return { api, calls, original, trial };
+  return { api, calls, cards, original, trial, article };
 }
 
 test('마지막 쪽 채움이 35% 미만이면 그 기사만 한 번 다시 나눠 줄어든 쪽수를 채택한다', () => {
@@ -522,6 +661,16 @@ test('쪽수가 그대로거나 오류, 넘침, 예외가 생긴 촘촘한 시�
     const { api, calls, original } = paginationTrial({ ...options, originalFailure: true });
     assert.equal(calls.length, 2); assert.deepEqual(api.state.pages.slice(1), original);
     assert.deepEqual(api.state.failures, ['이전 기사 오류', '기존 오류']);
+  }
+});
+
+test('질문 띠는 촘촘한 재분할로도 쪽이 줄지 않았을 때 복원된 마지막 쪽에만 시도한다', () => {
+  for (const options of [{ compactCount: 2 }, { compactCount: 3 }, { throws: true }]) {
+    const { cards, original, article } = paginationTrial(options);
+    assert.deepEqual(cards, [{ page: original.at(-1), article }]);
+  }
+  for (const options of [{}, { normalCount: 1 }, { fill: .35 }]) {
+    assert.deepEqual(paginationTrial(options).cards, []);
   }
 });
 
