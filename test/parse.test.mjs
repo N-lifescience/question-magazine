@@ -9,7 +9,7 @@ const { parseArticle, parseCover, ready, imagesReady } = require('../magazine.js
 // public API stays unchanged; this exercises the real save/reload grammar.
 const source = readFileSync(new URL('../magazine.js', import.meta.url), 'utf8');
 const sandbox = { module: { exports: {} }, URL };
-const helpers = ['serialize', 'readPieces', 'droppedImageURL', 'pieceFigures', 'hasArticleImages', 'coverQuestions', 'articleQuestion', 'addArticleQuestion', 'state', 'prepareImages', 'shrinkImage', 'replaceFigure', 'unsavedImages', 'hasUnsavedImages', 'inline', 'fillRatio', 'renderArticle', 'renderCover', 'renderAuthorNotes'];
+const helpers = ['serialize', 'readPieces', 'droppedImageURL', 'pieceFigures', 'hasArticleImages', 'coverQuestions', 'articleQuestion', 'addArticleQuestion', 'state', 'prepareImages', 'shrinkImage', 'replaceFigure', 'unsavedImages', 'hasUnsavedImages', 'inline', 'fillRatio', 'renderArticle', 'renderCover', 'renderAuthorNotes', 'agentText', 'copyText'];
 const expose = helpers.map(name => '  api.' + name + ' = ' + name + ';').join('\n') + '\n  api.setSurface = function (surface) { stage = surface; };';
 runInNewContext(source.replace('  return api;\n}));', expose + '\n  return api;\n}));'), sandbox);
 const serialize = sandbox.module.exports.serialize;
@@ -807,5 +807,70 @@ for (const filename of ['article.html', 'magazine.html']) {
     }
   });
 }
+
+test('AI에게 보낼 말: 에이전트 문법 그대로 돌려주고 다시 읽으면 같은 기사', () => {
+  const ex = sandbox.module.exports;
+  const src = [
+    '꼭지: 자연과학', '제목: 왜 아침에 키가 클까?', '부제: 밤마다 물을 머금는 쿠션', '기자: 새벽별',
+    '그림: https://example.org/hero.jpg?se=1&sig=a%3D | 문틀에 선을 긋는 장면',
+    '그림: https://example.org/how.jpg?se=1&sig=b%3D | 디스크가 눌리는 모습',
+    '기자의 말: 처음에는 자라는 줄 알았다. 이제는 줄었다가 돌아오는 것을 안다.',
+    '## 문틀의 두 줄', '아침과 밤의 키가 1.5cm 달랐다.', '> 키는 하루 동안 줄었다가 돌아온다.', '디스크는 물을 머금는다.',
+    '[쉽게 보기] 다섯 살 동생에게 설명하면', '그림: https://example.org/e1.jpg | 밤에 쿠션이 부풀어요', '그림: https://example.org/e2.jpg | 낮에 눌려요', '그림: https://example.org/e3.jpg | 다시 부풀어요',
+    '[취재 노트]', '처음 질문: 아침 키', '바뀐 질문: 어디가 줄어들까?', 'AI 사용: 근거 찾기, 그림 생성',
+    '출처:', '1. NASA, What is your space height?, 2018, https://www.nasa.gov/a.pdf',
+  ].join('\n');
+  const piece = parseArticle(src);
+  const text = ex.agentText(piece);
+  assert.ok(!/\[문단\]/.test(text), '방패 표시를 달지 않는다');
+  for (const line of ['부제: 밤마다 물을 머금는 쿠션', '## 문틀의 두 줄', '> 키는 하루 동안 줄었다가 돌아온다.', '[쉽게 보기] 다섯 살 동생에게 설명하면', '그림: https://example.org/how.jpg?se=1&sig=b%3D | 디스크가 눌리는 모습', '바뀐 질문: 어디가 줄어들까?', '1. NASA, What is your space height?, 2018, https://www.nasa.gov/a.pdf']) assert.ok(text.includes(line), line);
+  const again = parseArticle(text);
+  assert.deepEqual(serialize(again), serialize(piece), '다시 읽으면 같은 기사');
+});
+
+test('AI에게 보낼 말: 파일 안 그림은 원래 주소로, 모르면 표시만', () => {
+  const ex = sandbox.module.exports;
+  const piece = parseArticle('제목: 물음\n그림: https://example.org/a.jpg | 가\n문단\n그림: https://example.org/b.jpg | 나');
+  piece.hero.remote = piece.hero.src; piece.hero.src = 'data:image/jpeg;base64,AAAA';
+  const figure = piece.blocks.find(b => b.type === 'figure'); figure.src = 'data:image/jpeg;base64,BBBB';
+  const text = ex.agentText(piece);
+  assert.ok(text.includes('그림: https://example.org/a.jpg | 가'));
+  assert.ok(text.includes('그림: (파일 안 그림) | 나'));
+  assert.ok(!text.includes('base64'));
+});
+
+test('AI에게 보낼 말: 출처 번호만 있는 줄은 가장 가까운 앞 문단에 붙어 사라지지 않는다', () => {
+  const ex = sandbox.module.exports;
+  const piece = parseArticle('제목: 물음\n첫 문단이다.\n(출처: 기관, 자료, 2024, https://example.org/a)\n> 따옴글이다.\n(출처: 기관, 다른 자료, 2025, https://example.org/b)\n둘째 문단이다.');
+  const text = ex.agentText(piece);
+  assert.ok(!/^\s*\[\d+\]\s*$/m.test(text), '번호만 있는 줄이 남지 않는다');
+  const again = parseArticle(text);
+  assert.deepEqual(again.sources, piece.sources);
+  assert.equal(ex.agentText(again), text, '두 번 바꿔도 같다');
+});
+
+test('AI에게 보낼 말: 저장본의 data-qm-remote로 원래 그림 주소를 되돌린다', () => {
+  const ex = sandbox.module.exports;
+  const html = '<script type="text/x-article" data-qm-remote="https://example.org/a.jpg?se=1&amp;sig=x%3D - https://example.org/c.jpg">\n제목: 물음\n그림: data:image/jpeg;base64,AAAA | 가\n문단\n[쉽게 보기] 쉽게\n그림: data:image/jpeg;base64,BBBB | 나\n그림: data:image/jpeg;base64,CCCC | 다\n</script>';
+  const [piece] = readPieces(html, true);
+  const text = ex.agentText(piece);
+  assert.ok(text.includes('그림: https://example.org/a.jpg?se=1&sig=x%3D | 가'), text);
+  assert.ok(text.includes('그림: (파일 안 그림) | 나'));
+  assert.ok(text.includes('그림: https://example.org/c.jpg | 다'));
+});
+
+test('AI에게 보낼 말: 기사마다 [지금 기사 글], 끝에 고칠 곳', () => {
+  const ex = sandbox.module.exports;
+  ex.state.pieces = [];
+  assert.equal(ex.copyText(), '');
+  ex.state.pieces = [parseCover('잡지: 쌍용의 질문\n호: 2026 창간호\n대표 질문: 왜?')];
+  assert.match(ex.copyText(), /^\[지금 표지 글\]\n잡지: 쌍용의 질문\n호: 2026 창간호\n대표 질문: 왜\?\n\n고칠 곳: $/);
+  ex.state.pieces.push(parseArticle('꼭지: 자연과학\n제목: 하나\n문단'), parseArticle('꼭지: 사회과학\n제목: 둘\n문단'));
+  const text = ex.copyText();
+  assert.equal(text.match(/\[지금 기사 글\]/g).length, 2);
+  assert.ok(!text.includes('[지금 표지 글]'), '기사가 있으면 기사 글만');
+  assert.ok(text.endsWith('\n\n고칠 곳: '));
+  ex.state.pieces = [];
+});
 
 console.log(`\n${passed}개 시험 통과`);

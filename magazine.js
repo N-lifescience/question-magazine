@@ -282,6 +282,7 @@
     .qm-hint,.qm-status,.qm-message { margin:12px 0 0; font-size:16px; line-height:1.6; }
     .qm-status[data-error='true'] { color:#a1211b; font-weight:700; }
     .qm-message:empty { display:none; }
+    .qm-copy { display:block; box-sizing:border-box; width:100%; min-height:160px; margin:8px 0 0; padding:10px 12px; font:15px/1.6 system-ui,sans-serif; word-break:keep-all; overflow-wrap:anywhere; }
     .qm-order { margin-top:16px; }
     .qm-order[hidden] { display:none; }
     .qm-order ol { list-style:none; padding:0; margin:12px 0; }
@@ -482,7 +483,8 @@
         try { url = await fetchImage(src, entry.limit); } catch (error) { /* Keep the original address for display and saving. */ }
         job.pending = false;
         if (imageJobs.get(model) !== job || model.src !== src) return;
-        if (url) model.src = url;
+        // Remember the agent's https address so 「AI에게 보낼 말 복사」 can hand it back.
+        if (url) { model.remote = src; model.src = url; }
         await updateFigureViews(model); refreshStatus();
       }()));
     }); });
@@ -526,7 +528,7 @@
           url = await shrinkImage(await readImage(input.slice(0, input.size, mime)), limit);
         }
         if (imageJobs.get(model) !== token) return;
-        model.src = url; token.pending = false;
+        model.remote = external ? src : ''; model.src = url; token.pending = false;
         if (external) unsavedImages.add(model); else unsavedImages.delete(model);
         await updateFigureViews(model);
         // Only the attribution changes; fixed image frames need no repagination.
@@ -542,6 +544,7 @@
     var frame = element('div', 'qm-image-frame');
     var limit = hero ? 1600 : 900;
     frame.tabIndex = 0; frame.setAttribute('role', 'button'); frame.setAttribute('aria-label', (model.caption || '그림') + ' — 그림 고르기');
+    frame.title = '눌러서 다른 그림 파일로 바꾸거나, 다른 탭의 그림을 끌어다 놓으세요.';
     function choose() {
       var input = element('input'); input.type = 'file'; input.accept = 'image/*';
       input.addEventListener('change', function () { replaceFigure(model, input.files[0], limit); }); input.click();
@@ -1040,6 +1043,12 @@
     var text = script.textContent;
     return script.getAttribute('data-qm-encoding') === 'uri' ? decodeURIComponent(text) : text;
   }
+  // 저장본의 data-qm-remote(그림 차례대로 원래 주소, 없으면 -)를 그림 모델에 되돌린다.
+  function restoreRemote(piece, value) {
+    var list = String(value || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').split(/\s+/);
+    pieceFigures(piece).forEach(function (entry, index) { if (/^https:\/\//i.test(list[index] || '')) entry.model.remote = list[index]; });
+    return piece;
+  }
   function readPieces(text, html) {
     if (html || /<script\b/i.test(text)) {
       // Extract only raw script text. Parsing arbitrary imported HTML into a
@@ -1051,7 +1060,7 @@
         var type = htmlAttribute(match[1], 'type').toLowerCase();
         if (type !== 'text/x-article' && type !== 'text/x-cover') continue;
         var raw = htmlAttribute(match[1], 'data-qm-encoding') === 'uri' ? decodeURIComponent(match[2].trim()) : match[2];
-        pieces.push(type === 'text/x-cover' ? parseCover(raw) : parseArticle(raw));
+        pieces.push(restoreRemote(type === 'text/x-cover' ? parseCover(raw) : parseArticle(raw), htmlAttribute(match[1], 'data-qm-remote')));
       }
       if (pieces.length) return pieces;
       if (html) throw new Error('기사 글이 든 파일을 골라 주세요.');
@@ -1130,6 +1139,52 @@
     if (piece.sources.length) { lines.push('', '출처:'); piece.sources.forEach(function (source, index) { lines.push((index + 1) + '. ' + source); }); }
     return lines.join('\n');
   }
+  // 에이전트 4단계 문법 그대로의 글(학생이 붙여 넣어 '이 줄만 고쳐 줘'라고 할 때 쓴다).
+  // serialize와 달리 [문단] 방패를 달지 않고, 파일 안 그림(data:)은 원래 https 주소로 돌려놓는다.
+  function agentText(piece) {
+    function address(model) { return /^data:/i.test(model.src || '') ? (model.remote || '(파일 안 그림)') : model.src; }
+    function picture(model) { return '그림: ' + address(model) + (model.caption ? ' | ' + model.caption : ''); }
+    function put(lines, key, value) { if (value) lines.push(key + ': ' + value); }
+    var lines = [];
+    if (piece.kind === 'cover') {
+      put(lines, '잡지', piece.name); put(lines, '호', piece.issue); put(lines, '문구', piece.tagline);
+      if (piece.hero) lines.push(picture(piece.hero));
+      put(lines, '대표 질문', piece.question); return lines.join('\n');
+    }
+    put(lines, '꼭지', piece.section); put(lines, '제목', piece.title); put(lines, '부제', piece.subtitle); put(lines, '기자', piece.author);
+    if (piece.hero) lines.push(picture(piece.hero));
+    put(lines, '기자의 말', piece.authorNote);
+    var lastParagraph = -1;
+    piece.blocks.forEach(function (block) {
+      if (block.type === 'figure') lines.push(picture(block));
+      // 덩어리 뒤 빈 줄: 없으면 다음 그림 줄이 쉽게 보기의 넷째 컷으로 붙는다.
+      else if (block.type === 'easy') { lines.push('[쉽게 보기] ' + block.title); block.panels.forEach(function (panel) { lines.push(picture(panel)); }); lines.push(''); }
+      else if (block.type === 'box') { lines.push('[상자] ' + block.title); block.lines.forEach(function (line) { lines.push((line.bullet ? '- ' : '') + line.text); }); lines.push(''); }
+      // 출처 번호만 있는 문단('[8]')은 따로 두면 다시 읽을 때 표시로 지워진다. 가장 가까운 앞 문단 끝에 붙인다.
+      else if (block.type === 'paragraph' && /^(?:\s*\[\d+\])+\s*$/.test(block.text) && lastParagraph >= 0) lines[lastParagraph] += ' ' + block.text.trim();
+      else { lines.push((block.type === 'heading' ? '## ' : block.type === 'quote' ? '> ' : '') + block.text); if (block.type === 'paragraph') lastParagraph = lines.length - 1; }
+    });
+    if (piece.notes.length) { lines.push('[취재 노트]'); piece.notes.forEach(function (note) { lines.push(note.key + ': ' + note.value); }); }
+    if (piece.sources.length) { lines.push('출처:'); piece.sources.forEach(function (source, index) { lines.push((index + 1) + '. ' + source); }); }
+    return lines.join('\n');
+  }
+  function copyText() {
+    var articles = orderedArticles(), cover = state.pieces.find(function (piece) { return piece.kind === 'cover'; });
+    var parts = articles.length ? articles.map(function (piece) { return '[지금 기사 글]\n' + agentText(piece); }) : cover ? ['[지금 표지 글]\n' + agentText(cover)] : [];
+    return parts.length ? parts.join('\n\n') + '\n\n고칠 곳: ' : '';
+  }
+  async function copyForAI() {
+    var text = copyText();
+    if (!text) { announce('복사할 글이 없습니다.'); return; }
+    try { await navigator.clipboard.writeText(text); announce('복사했습니다. 에이전트 대화에 붙여 넣고 「고칠 곳:」 뒤에 고칠 것을 적어 주세요.'); }
+    catch (error) {
+      // 클립보드를 막은 브라우저에서는 글을 보여 주고 직접 복사하게 한다.
+      var area = document.querySelector('.qm-copy') || element('textarea', 'qm-copy');
+      area.readOnly = true; area.value = text; area.setAttribute('aria-label', 'AI에게 보낼 말');
+      if (!area.isConnected) message.after(area);
+      area.focus(); area.select(); announce('아래 글을 모두 골라 복사한 뒤 에이전트 대화에 붙여 넣어 주세요.');
+    }
+  }
   async function saveMagazine(event) {
     var control = event.currentTarget; control.disabled = true; announce('그림을 담아 잡지 파일을 만들고 있습니다.');
     try {
@@ -1147,6 +1202,9 @@
         // Raw-text script elements cannot contain their own HTML closing tag.
         // URI encoding is marked and decoded on import; no user HTML is executed.
         if (/<\/script/i.test(raw)) { script.setAttribute('data-qm-encoding', 'uri'); raw = encodeURIComponent(raw); }
+        // 파일 안에 넣은 그림의 원래 https 주소(그림 차례대로, 없으면 -). 「AI에게 보낼 말 복사」가 다시 쓴다.
+        var remotes = pieceFigures(piece).map(function (entry) { return /^data:/i.test(entry.model.src || '') && entry.model.remote ? entry.model.remote : '-'; });
+        if (remotes.some(function (value) { return value !== '-'; })) script.setAttribute('data-qm-remote', remotes.join(' '));
         script.textContent = '\n' + raw + '\n'; body.appendChild(script);
       });
       html.appendChild(head); html.appendChild(body);
@@ -1160,7 +1218,7 @@
   function mount() {
     try {
       var initial = Array.from(document.querySelectorAll('script[type="text/x-cover"],script[type="text/x-article"]'));
-      initial.forEach(function (script) { merge(script.type === 'text/x-cover' ? parseCover(scriptText(script)) : parseArticle(scriptText(script))); });
+      initial.forEach(function (script) { merge(restoreRemote(script.type === 'text/x-cover' ? parseCover(scriptText(script)) : parseArticle(scriptText(script)), script.getAttribute('data-qm-remote'))); });
       state.bleed = document.body.dataset.qmBleed === 'true'; installStyles(); clear(document.body); document.body.className = 'qm-app'; document.documentElement.lang = 'ko';
       var toolbar = element('header', 'qm-toolbar'); toolbar.appendChild(element('h1', '', '질문 잡지'));
       var tools = element('div', 'qm-tools'); toolbar.appendChild(tools);
@@ -1170,6 +1228,7 @@
       var order = button('차례 고치기', function () { orderPanel.hidden = !orderPanel.hidden; order.setAttribute('aria-expanded', String(!orderPanel.hidden)); });
       order.setAttribute('aria-expanded', 'false'); order.setAttribute('aria-controls', 'qm-order'); tools.appendChild(order);
       tools.appendChild(button('잡지 파일로 저장', saveMagazine));
+      tools.appendChild(button('AI에게 보낼 말 복사', copyForAI));
       tools.appendChild(button('인쇄', function () { state.queue.then(function () { window.print(); }); }));
       var label = element('label', 'qm-bleed'), checkbox = element('input'); checkbox.type = 'checkbox'; checkbox.checked = state.bleed;
       checkbox.addEventListener('change', function () { state.bleed = checkbox.checked; render(); }); label.appendChild(checkbox); label.appendChild(document.createTextNode('도련 3mm')); tools.appendChild(label);
